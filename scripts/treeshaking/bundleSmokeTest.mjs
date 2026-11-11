@@ -1,0 +1,614 @@
+#!/usr/bin/env node
+/* eslint-disable babylonjs/syntax */
+/* eslint-disable no-console */
+/**
+ * Tree-Shaking Bundle Smoke Test
+ *
+ * Verifies that importing side-effect-free modules produces minimal/empty bundles.
+ * Uses both Rollup and Webpack programmatically.
+ *
+ * Usage:
+ *   node scripts/treeshaking/bundleSmokeTest.mjs
+ *
+ * Prerequisites:
+ *   - packages/dev/core must be compiled (dist/ must exist)
+ *   - rollup and webpack must be available
+ */
+
+import { writeFileSync, mkdirSync, readFileSync, rmSync, statSync } from "fs";
+import { join, resolve, dirname, relative } from "path";
+import { fileURLToPath } from "url";
+import { createRequire } from "module";
+import { spawnSync } from "child_process";
+import { resolvePackageFromArgv, SUPPORTED_PACKAGES, packageArgs, getPackageConfig } from "./packageConfig.mjs";
+import { readSideEffectsManifest } from "./sideEffectsManifest.mjs";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const REPO_ROOT = resolve(__dirname, "../..");
+const PACKAGE = resolvePackageFromArgv();
+const TMP_DIR = join(REPO_ROOT, "scripts/treeshaking/.tmp");
+const CORE_DIST = join(REPO_ROOT, "packages/dev/core/dist");
+const SERIALIZERS_DIST = join(REPO_ROOT, "packages/dev/serializers/dist");
+// Dist of the package under test. GUI tests also bundle Core to validate purity
+// across that package boundary; other secondary package dependencies stay external.
+const PKG_DIST = join(REPO_ROOT, "packages/dev", PACKAGE, "dist");
+const IS_ADO = !!process.env.TF_BUILD;
+
+function toPosixPath(filePath) {
+    return filePath.split(/[/\\]+/).join("/");
+}
+
+function createBundlePackageContext(packageName, distRoot) {
+    const packageConfig = getPackageConfig(packageName);
+    const sideEffectFiles = new Set(
+        readSideEffectsManifest(packageConfig.manifestDir)
+            .manifest.filter((entry) => entry.sideEffects.some((sideEffect) => sideEffect.type !== "declare-module"))
+            .map((entry) => toPosixPath(entry.file))
+    );
+
+    return { distRoot, sideEffectFiles };
+}
+
+const bundlePackageContexts = [createBundlePackageContext(PACKAGE, PKG_DIST)];
+if (PACKAGE === "gui") {
+    bundlePackageContexts.push(createBundlePackageContext("core", CORE_DIST));
+}
+
+function getBundledModuleSideEffects(id) {
+    const cleanId = id.split("?")[0];
+    for (const context of bundlePackageContexts) {
+        const relPath = toPosixPath(relative(context.distRoot, cleanId));
+        if (relPath === ".." || relPath.startsWith("../") || !relPath.endsWith(".js")) {
+            continue;
+        }
+
+        const sourcePath = relPath.slice(0, -".js".length) + ".ts";
+        return sourcePath === "index.ts" || sourcePath.endsWith("/index.ts") || context.sideEffectFiles.has(sourcePath);
+    }
+
+    return null;
+}
+
+function resolveCoreImport(source) {
+    if (PACKAGE !== "gui") {
+        return null;
+    }
+    if (source === "core") {
+        return join(CORE_DIST, "index.js");
+    }
+    if (!source.startsWith("core/")) {
+        return null;
+    }
+
+    const subpath = source.substring("core/".length);
+    return join(CORE_DIST, subpath.endsWith(".js") ? subpath : `${subpath}.js`);
+}
+
+function adoError(msg) {
+    if (IS_ADO) {
+        console.log(`##vso[task.logissue type=error]${msg}`);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function ensureDir(dir) {
+    mkdirSync(dir, { recursive: true });
+}
+
+function cleanup() {
+    rmSync(TMP_DIR, { recursive: true, force: true });
+}
+
+function fileSize(path) {
+    try {
+        return statSync(path).size;
+    } catch {
+        return -1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test cases
+// ---------------------------------------------------------------------------
+
+/**
+ * @typedef {Object} TestCase
+ * @property {string} name
+ * @property {string} entryCode - JS code for the entry file
+ * @property {number} maxBundleSizeBytes - Threshold for the test to pass
+ * @property {number} [minBundleSizeBytes] - Lower threshold for sanity cases that must retain imported code
+ * @property {string[]} [forbiddenStrings] - Strings that must not appear in the bundled output
+ * @property {string} description
+ */
+
+/** @type {TestCase[]} */
+const CORE_TEST_CASES = [
+    {
+        name: "thinmaths-import",
+        entryCode: `import "${CORE_DIST}/Maths/ThinMaths/index.js";\n`,
+        // ThinMaths is marked side-effect-free. If tree-shaking works,
+        // an import with no used exports should produce a near-empty bundle.
+        // We use a generous threshold since the module does export real code.
+        maxBundleSizeBytes: 500,
+        description: "Bare import of ThinMaths (side-effect-free) should produce near-empty bundle",
+    },
+    {
+        name: "thinmaths-named-import",
+        entryCode: `import { ThinMatrix } from "${CORE_DIST}/Maths/ThinMaths/index.js";\nconsole.log(ThinMatrix);\n`,
+        // When we actually USE an export, the bundle should contain code.
+        // This is a sanity check that bundling works at all.
+        maxBundleSizeBytes: Infinity, // no size limit — just verify it bundles
+        description: "Named import of ThinMatrix should bundle successfully (sanity check)",
+    },
+    {
+        name: "math-color-pure-bare",
+        entryCode: `import "${CORE_DIST}/Maths/math.color.pure.js";\n`,
+        maxBundleSizeBytes: 500,
+        description: "Bare import of math.color.pure (side-effect-free) should produce near-empty bundle",
+    },
+    {
+        name: "math-color-pure-named",
+        entryCode: `import { Color3 } from "${CORE_DIST}/Maths/math.color.pure.js";\nconsole.log(Color3);\n`,
+        maxBundleSizeBytes: Infinity,
+        description: "Named import of Color3 from math.color.pure should bundle (sanity check)",
+    },
+    {
+        name: "math-vector-pure-bare",
+        entryCode: `import "${CORE_DIST}/Maths/math.vector.pure.js";\n`,
+        maxBundleSizeBytes: 500,
+        description: "Bare import of math.vector.pure (side-effect-free) should produce near-empty bundle",
+    },
+    {
+        name: "maths-pure-barrel-bare",
+        entryCode: `import "${CORE_DIST}/Maths/pure.js";\n`,
+        maxBundleSizeBytes: 500,
+        description: "Bare import of Maths/pure barrel should produce near-empty bundle",
+    },
+    {
+        name: "cameras-pure-barrel-bare",
+        entryCode: `import "${CORE_DIST}/Cameras/pure.js";\n`,
+        maxBundleSizeBytes: 500,
+        description: "Bare import of Cameras/pure barrel should produce near-empty bundle",
+    },
+    {
+        name: "root-pure-barrel-bare",
+        entryCode: `import "${CORE_DIST}/pure.js";\n`,
+        maxBundleSizeBytes: 500,
+        description: "Bare import of root pure barrel should produce near-empty bundle",
+    },
+    {
+        name: "root-pure-barrel-named",
+        entryCode: `import { Color3 } from "${CORE_DIST}/pure.js";\nconsole.log(Color3);\n`,
+        maxBundleSizeBytes: Infinity,
+        description: "Named import of Color3 from root pure barrel should bundle (sanity check)",
+    },
+    // ── Phase 4: free-function granularity tests ────────────────────────────
+    {
+        name: "vector-functions-bare",
+        entryCode: `import "${CORE_DIST}/Maths/math.vector.functions.js";\n`,
+        maxBundleSizeBytes: 500,
+        description: "Bare import of math.vector.functions (side-effect-free) should produce near-empty bundle",
+    },
+    {
+        name: "vector-functions-named",
+        entryCode: `import { Vector3Dot } from "${CORE_DIST}/Maths/math.vector.functions.js";\nconsole.log(Vector3Dot);\n`,
+        maxBundleSizeBytes: Infinity,
+        description: "Named import of single free function should bundle only that function",
+    },
+    {
+        name: "scalar-functions-bare",
+        entryCode: `import "${CORE_DIST}/Maths/math.scalar.functions.js";\n`,
+        maxBundleSizeBytes: 500,
+        description: "Bare import of math.scalar.functions (side-effect-free) should produce near-empty bundle",
+    },
+    {
+        name: "scalar-functions-named",
+        entryCode: `import { ExtractAsInt } from "${CORE_DIST}/Maths/math.scalar.functions.js";\nconsole.log(ExtractAsInt);\n`,
+        maxBundleSizeBytes: Infinity,
+        description: "Named import of ExtractAsInt should bundle only that function",
+    },
+    {
+        name: "geospatial-functions-bare",
+        entryCode: `import "${CORE_DIST}/Maths/math.geospatial.functions.js";\n`,
+        maxBundleSizeBytes: 500,
+        description: "Bare import of math.geospatial.functions (side-effect-free) should produce near-empty bundle",
+    },
+    {
+        name: "pure-barrel-named-function",
+        entryCode: `import { Vector3Dot } from "${CORE_DIST}/Maths/pure.js";\nconsole.log(Vector3Dot);\n`,
+        maxBundleSizeBytes: Infinity,
+        description: "Named import of free function through pure barrel should bundle only that function",
+    },
+    // ── Phase 9: registration function tests ────────────────────────────────
+    {
+        name: "registration-pure-bare",
+        entryCode: `import "${CORE_DIST}/Culling/ray.pure.js";\n`,
+        maxBundleSizeBytes: 500,
+        description: "Bare import of .pure.js with registration function — function should be tree-shaken",
+    },
+    {
+        name: "registration-pure-named-call",
+        entryCode: `import { RegisterRay } from "${CORE_DIST}/Culling/ray.pure.js";\nRegisterRay();\n`,
+        maxBundleSizeBytes: Infinity,
+        minBundleSizeBytes: 100,
+        description: "Import + call of registration function should bundle correctly (sanity check)",
+    },
+    {
+        name: "texture-loaders-registration-pure-bare",
+        entryCode: `import "${CORE_DIST}/Engines/AbstractEngine/abstractEngine.textureLoaders.pure.js";\n`,
+        maxBundleSizeBytes: 500,
+        description: "Bare import of the texture loader registration module should produce a near-empty bundle",
+    },
+    {
+        name: "texture-loaders-registration-pure-named-call",
+        entryCode: `import { RegisterAbstractEngineTextureLoaders } from "${CORE_DIST}/Engines/AbstractEngine/abstractEngine.textureLoaders.pure.js";\nRegisterAbstractEngineTextureLoaders();\n`,
+        maxBundleSizeBytes: Infinity,
+        minBundleSizeBytes: 100,
+        description: "Import + call of the texture loader registration function should retain its implementation",
+    },
+    {
+        name: "registration-types-only",
+        entryCode: `import "${CORE_DIST}/Buffers/buffer.align.types.js";\n`,
+        maxBundleSizeBytes: 500,
+        description: "Bare import of .types.js should produce near-empty bundle (types only)",
+    },
+    {
+        name: "registration-engine-pure-bare",
+        entryCode: `import "${CORE_DIST}/Rendering/depthRendererSceneComponent.pure.js";\n`,
+        maxBundleSizeBytes: 500,
+        description: "Bare import of scene component .pure.js — registration function should be tree-shaken",
+    },
+    {
+        name: "registration-engine-pure-named-call",
+        entryCode: `import { RegisterDepthRendererSceneComponent } from "${CORE_DIST}/Rendering/depthRendererSceneComponent.pure.js";\nimport { DepthRenderer } from "${CORE_DIST}/Rendering/depthRenderer.pure.js";\nRegisterDepthRendererSceneComponent(DepthRenderer);\n`,
+        maxBundleSizeBytes: Infinity,
+        minBundleSizeBytes: 100,
+        forbiddenStrings: ["GaussianSplattingMeshBase"],
+        description: "Import + call of scene component registration function should bundle correctly",
+    },
+];
+
+/**
+ * Per-package smoke test cases. Secondary packages prove that an unused,
+ * side-effect-free `.pure.js` (e.g. a glTF exporter extension) tree-shakes away,
+ * while importing + calling its `Register*` function retains the code.
+ * @type {Record<string, TestCase[]>}
+ */
+const TEST_CASES_BY_PACKAGE = {
+    core: CORE_TEST_CASES,
+    gui: [
+        {
+            name: "gui-root-pure-barrel-bare",
+            entryCode: `import "${PKG_DIST}/pure.js";\n`,
+            maxBundleSizeBytes: 500,
+            description: "Bare import of the GUI pure barrel, including Core dependencies, should produce a near-empty bundle",
+        },
+        {
+            name: "gui-advanced-dynamic-texture-bare",
+            entryCode: `import "${PKG_DIST}/2D/advancedDynamicTexture.js";\n`,
+            maxBundleSizeBytes: 500,
+            description: "Bare import of AdvancedDynamicTexture, including Core dependencies, should produce a near-empty bundle",
+        },
+        {
+            name: "gui-advanced-dynamic-texture-named",
+            entryCode: `import { AdvancedDynamicTexture } from "${PKG_DIST}/2D/advancedDynamicTexture.js";\nconsole.log(AdvancedDynamicTexture);\n`,
+            maxBundleSizeBytes: Infinity,
+            minBundleSizeBytes: 100,
+            description: "Named import of AdvancedDynamicTexture should retain the class (sanity check)",
+        },
+    ],
+    loaders: [
+        {
+            name: "loaders-gltf1-pure-barrel-bare",
+            entryCode: `import "${PKG_DIST}/glTF/1.0/pure.js";\n`,
+            maxBundleSizeBytes: 500,
+            description: "Bare import of the glTF 1.0 pure barrel should produce a near-empty bundle",
+        },
+        {
+            name: "loaders-gltf1-loader-register",
+            entryCode: `import { RegisterGLTF1Loader } from "${PKG_DIST}/glTF/1.0/glTFLoader.pure.js";\nRegisterGLTF1Loader();\n`,
+            maxBundleSizeBytes: Infinity,
+            minBundleSizeBytes: 100,
+            description: "Import + call of the glTF 1.0 loader registration function should retain its implementation",
+        },
+        {
+            name: "loaders-gltf1-extensions-register",
+            entryCode: `import { RegisterGLTFBinaryExtension } from "${PKG_DIST}/glTF/1.0/glTFBinaryExtension.pure.js";\nimport { RegisterGLTFMaterialsCommonExtension } from "${PKG_DIST}/glTF/1.0/glTFMaterialsCommonExtension.pure.js";\nRegisterGLTFBinaryExtension();\nRegisterGLTFMaterialsCommonExtension();\n`,
+            maxBundleSizeBytes: Infinity,
+            minBundleSizeBytes: 100,
+            description: "Import + call of the glTF 1.0 extension registration functions should retain their implementations",
+        },
+    ],
+    serializers: [
+        {
+            name: "serializers-extension-pure-bare",
+            entryCode: `import "${SERIALIZERS_DIST}/glTF/2.0/Extensions/EXT_lights_area.pure.js";\n`,
+            maxBundleSizeBytes: 500,
+            description: "Bare import of an unused glTF exporter extension (.pure) should tree-shake to a near-empty bundle",
+        },
+        {
+            name: "serializers-extension-pure-register",
+            entryCode: `import { RegisterEXT_lights_area } from "${SERIALIZERS_DIST}/glTF/2.0/Extensions/EXT_lights_area.pure.js";\nRegisterEXT_lights_area();\n`,
+            maxBundleSizeBytes: Infinity,
+            minBundleSizeBytes: 100,
+            description: "Import + call of the extension Register function should bundle (sanity check)",
+        },
+        {
+            name: "serializers-extensions-pure-barrel-bare",
+            entryCode: `import "${SERIALIZERS_DIST}/glTF/2.0/Extensions/pure.js";\n`,
+            maxBundleSizeBytes: 500,
+            description: "Bare import of the Extensions/pure barrel should tree-shake to a near-empty bundle",
+        },
+    ],
+};
+
+/** @type {TestCase[]} */
+const TEST_CASES = TEST_CASES_BY_PACKAGE[PACKAGE] ?? [];
+
+// ---------------------------------------------------------------------------
+// Rollup test
+// ---------------------------------------------------------------------------
+
+async function testWithRollup(testCase) {
+    const { rollup } = await import("rollup");
+
+    const entryPath = join(TMP_DIR, `${testCase.name}-entry.mjs`);
+    const outPath = join(TMP_DIR, `${testCase.name}-rollup-out.mjs`);
+    writeFileSync(entryPath, testCase.entryCode);
+
+    try {
+        const bundle = await rollup({
+            input: entryPath,
+            plugins: [
+                {
+                    name: "resolve-core-package",
+                    resolveId: resolveCoreImport,
+                },
+            ],
+            // GUI bundles Core too so its pure surface is verified across package boundaries.
+            external: (id) => {
+                if (id === entryPath) {
+                    return false;
+                }
+                if (resolveCoreImport(id) !== null) {
+                    return false;
+                }
+                if (getBundledModuleSideEffects(id) !== null) {
+                    return false;
+                }
+                return true;
+            },
+            treeshake: {
+                moduleSideEffects: (id) => {
+                    return getBundledModuleSideEffects(id) ?? true;
+                },
+            },
+            logLevel: "silent",
+        });
+
+        await bundle.write({
+            file: outPath,
+            format: "esm",
+        });
+        await bundle.close();
+
+        const size = fileSize(outPath);
+        const content = readFileSync(outPath, "utf-8").trim();
+        const minSize = testCase.minBundleSizeBytes ?? 0;
+        const forbiddenString = testCase.forbiddenStrings?.find((value) => content.includes(value));
+        const passed = size >= minSize && size <= testCase.maxBundleSizeBytes && forbiddenString === undefined;
+
+        return {
+            bundler: "rollup",
+            name: testCase.name,
+            passed,
+            size,
+            minSize,
+            maxSize: testCase.maxBundleSizeBytes,
+            error: forbiddenString ? `Bundle contains forbidden string "${forbiddenString}"` : undefined,
+            contentPreview: content.substring(0, 200),
+        };
+    } catch (err) {
+        return {
+            bundler: "rollup",
+            name: testCase.name,
+            passed: false,
+            error: err.message,
+        };
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Webpack test
+// ---------------------------------------------------------------------------
+
+async function testWithWebpack(testCase) {
+    const require = createRequire(import.meta.url);
+    const webpack = require("webpack");
+
+    const entryPath = join(TMP_DIR, `${testCase.name}-entry.mjs`);
+    const outDir = join(TMP_DIR, `${testCase.name}-webpack-out`);
+    writeFileSync(entryPath, testCase.entryCode);
+
+    return new Promise((resolvePromise) => {
+        const compiler = webpack({
+            mode: "production",
+            entry: entryPath,
+            output: {
+                path: outDir,
+                filename: "bundle.js",
+            },
+            optimization: {
+                usedExports: true,
+                sideEffects: true,
+                minimize: true,
+            },
+            resolve: {
+                extensions: [".js", ".mjs"],
+                alias: {
+                    // The compiled output uses "core/..." path-mapped imports
+                    core: CORE_DIST,
+                },
+            },
+            // Mirror the package manifests, including Core when testing GUI.
+            module: {
+                rules: [
+                    {
+                        test: (resource) => getBundledModuleSideEffects(resource) === true,
+                        sideEffects: true,
+                    },
+                    {
+                        test: (resource) => getBundledModuleSideEffects(resource) === false,
+                        sideEffects: false,
+                    },
+                ],
+            },
+        });
+
+        compiler.run((err, stats) => {
+            compiler.close(() => {});
+
+            if (err) {
+                resolvePromise({
+                    bundler: "webpack",
+                    name: testCase.name,
+                    passed: false,
+                    error: err.message,
+                });
+                return;
+            }
+
+            if (stats.hasErrors()) {
+                const info = stats.toJson({ errors: true });
+                resolvePromise({
+                    bundler: "webpack",
+                    name: testCase.name,
+                    passed: false,
+                    error: info.errors
+                        .map((e) => e.message)
+                        .join("\n")
+                        .substring(0, 500),
+                });
+                return;
+            }
+
+            const bundlePath = join(outDir, "bundle.js");
+            const size = fileSize(bundlePath);
+            const content = size > 0 ? readFileSync(bundlePath, "utf-8").trim() : "";
+            const minSize = testCase.minBundleSizeBytes ?? 0;
+            const forbiddenString = testCase.forbiddenStrings?.find((value) => content.includes(value));
+            const passed = size >= minSize && size <= testCase.maxBundleSizeBytes && forbiddenString === undefined;
+
+            resolvePromise({
+                bundler: "webpack",
+                name: testCase.name,
+                passed,
+                size,
+                minSize,
+                maxSize: testCase.maxBundleSizeBytes,
+                error: forbiddenString ? `Bundle contains forbidden string "${forbiddenString}"` : undefined,
+                contentPreview: content.substring(0, 200),
+            });
+        });
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
+async function main() {
+    console.log("\n=== Tree-Shaking Bundle Smoke Tests ===\n");
+
+    // `--all-packages`: re-run this script once per supported package and aggregate.
+    if (process.argv.includes("--all-packages")) {
+        const forwarded = process.argv.slice(2).filter((a) => a !== "--all-packages" && a !== "--package" && !a.startsWith("--package="));
+        let failed = 0;
+        for (const pkg of SUPPORTED_PACKAGES) {
+            const result = spawnSync(process.execPath, [__filename, ...forwarded, ...packageArgs(pkg)], { stdio: "inherit" });
+            if (result.status !== 0) {
+                failed++;
+            }
+        }
+        process.exit(failed > 0 ? 1 : 0);
+    }
+
+    if (TEST_CASES.length === 0) {
+        console.log(`No bundle smoke tests defined for ${PACKAGE}; skipping.\n`);
+        return;
+    }
+
+    // Check that the package under test is compiled. Core is required (it always
+    // builds before this stage); a missing secondary-package dist is skipped
+    // gracefully so the check never blocks on an unbuilt optional package.
+    try {
+        statSync(PKG_DIST);
+    } catch {
+        const msg = `packages/dev/${PACKAGE}/dist/ not found. Run \`npm run build:source\` first.`;
+        if (PACKAGE === "core") {
+            console.error(`ERROR: ${msg}`);
+            adoError(msg);
+            process.exit(1);
+        }
+        console.log(`${msg} Skipping ${PACKAGE} smoke tests.\n`);
+        return;
+    }
+
+    ensureDir(TMP_DIR);
+
+    const results = [];
+    let allPassed = true;
+
+    for (const tc of TEST_CASES) {
+        console.log(`--- ${tc.name}: ${tc.description} ---\n`);
+
+        const rollupResult = await testWithRollup(tc);
+        results.push(rollupResult);
+        const rollupIcon = rollupResult.passed ? "PASS" : "FAIL";
+        console.log(
+            `  Rollup:  ${rollupIcon}  (${rollupResult.size ?? "N/A"} bytes${rollupResult.minSize ? `, min ${rollupResult.minSize}` : ""}${rollupResult.maxSize !== Infinity ? `, max ${rollupResult.maxSize}` : ""})`
+        );
+        if (rollupResult.error) {
+            console.log(`    Error: ${rollupResult.error}`);
+        }
+        if (rollupResult.contentPreview && !rollupResult.passed) {
+            console.log(`    Content: ${rollupResult.contentPreview}`);
+        }
+
+        const webpackResult = await testWithWebpack(tc);
+        results.push(webpackResult);
+        const webpackIcon = webpackResult.passed ? "PASS" : "FAIL";
+        console.log(
+            `  Webpack: ${webpackIcon}  (${webpackResult.size ?? "N/A"} bytes${webpackResult.minSize ? `, min ${webpackResult.minSize}` : ""}${webpackResult.maxSize !== Infinity ? `, max ${webpackResult.maxSize}` : ""})`
+        );
+        if (webpackResult.error) {
+            console.log(`    Error: ${webpackResult.error}`);
+        }
+        if (webpackResult.contentPreview && !webpackResult.passed) {
+            console.log(`    Content: ${webpackResult.contentPreview}`);
+        }
+
+        console.log();
+
+        if (!rollupResult.passed || !webpackResult.passed) {
+            allPassed = false;
+            if (!rollupResult.passed) {
+                adoError(`Tree-shaking smoke test FAILED: ${tc.name} (Rollup) — ${rollupResult.size} bytes, max ${rollupResult.maxSize}`);
+            }
+            if (!webpackResult.passed) {
+                adoError(`Tree-shaking smoke test FAILED: ${tc.name} (Webpack) — ${webpackResult.size} bytes, max ${webpackResult.maxSize}`);
+            }
+        }
+    }
+
+    cleanup();
+
+    console.log(allPassed ? "All tests passed!" : "Some tests FAILED.");
+    process.exit(allPassed ? 0 : 1);
+}
+
+main();

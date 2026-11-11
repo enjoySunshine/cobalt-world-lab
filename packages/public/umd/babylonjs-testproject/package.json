@@ -1,0 +1,13 @@
+{
+    "name": "babylonjs-testproject",
+    "private": true,
+    "version": "9.35.0",
+    "files": [
+        "*"
+    ],
+    "scripts": {
+        "build": "tsc"
+    },
+    "dependencies": {},
+    "sideEffects": true
+}

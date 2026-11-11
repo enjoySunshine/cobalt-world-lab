@@ -1,0 +1,41 @@
+{
+    "name": "@tools/flow-graph-editor",
+    "private": true,
+    "version": "1.0.0",
+    "files": [
+        "dist"
+    ],
+    "types": "dist/index.d.ts",
+    "main": "dist/index.js",
+    "module": "dist/index.js",
+    "scripts": {
+        "build": "npm run clean && npm run compile",
+        "build:declaration": "build-tools -c pud --config ./config.json",
+        "build:deployment": "npm run clean && vite build",
+        "compile": "tsc -b tsconfig.build.json",
+        "postcompile": "build-tools -c pa",
+        "serve": "vite",
+        "test:e2e": "playwright test -c ../../../playwright.config.ts --project=flowGraphEditor",
+        "test:e2e:ui": "playwright test -c ../../../playwright.config.ts --project=flowGraphEditor --ui",
+        "clean": "rimraf dist && rimraf *.tsbuildinfo -g"
+    },
+    "dependencies": {
+        "jsonc-parser": "^3.3.1",
+        "react": "^18.3.1",
+        "react-dom": "^18.3.1"
+    },
+    "devDependencies": {
+        "@dev/build-tools": "1.0.0",
+        "@dev/core": "1.0.0",
+        "@dev/loaders": "1.0.0",
+        "@dev/shared-ui-components": "1.0.0",
+        "@fluentui-contrib/react-resize-handle": "^0.8.4",
+        "@fluentui/react-components": "^9.74.11",
+        "@fluentui/react-icons": "^2.0.344",
+        "@fluentui/react-positioning": "^9.23.4",
+        "@tools/snippet-loader": "1.0.0",
+        "@types/react": "^18.3.31",
+        "@types/react-dom": "^18.3.7"
+    },
+    "sideEffects": true
+}

@@ -1,0 +1,95 @@
+{
+  "name": "@babylonjs/viewer",
+  "version": "9.35.0",
+  "type": "module",
+  "main": "lib/full/index.js",
+  "module": "lib/full/index.js",
+  "esnext": "lib/full/index.js",
+  "types": "lib/full/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/full/index.d.ts",
+      "default": "./lib/full/index.js"
+    },
+    "./lite": {
+      "types": "./lib/lite/index.d.ts",
+      "default": "./lib/lite/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/**/*.js",
+    "lib/**/*.d.ts",
+    "lib/**/*.map",
+    "dist/**/*.js",
+    "dist/**/*.map",
+    "assets/**",
+    "readme.md",
+    "docs/**",
+    "license.md"
+  ],
+  "nx": {
+    "targets": {
+      "build": {
+        "inputs": [
+          "default",
+          "^default",
+          "{workspaceRoot}/packages/tools/viewer/**/*"
+        ]
+      }
+    }
+  },
+  "scripts": {
+    "start": "npm run serve -- --open test/apps/web/index.html",
+    "start:prod": "serve . --listen 1343",
+    "start:prod:brotli": "node serve.brotli-max.mjs",
+    "serve": "vite",
+    "build": "npm run clean && npm run bundle",
+    "clean": "rimraf lib && rimraf dist && rimraf *.tsbuildinfo -g",
+    "bundle": "npm run bundle:lib && npm run bundle:dist:esm",
+    "bundle:lib": "rollup -c rollup.config.lib.mjs",
+    "bundle:dist:esm": "rollup -c rollup.config.dist.esm.mjs",
+    "analyze": "npm run bundle:dist:esm && node ../../../../scripts/open.mjs .sonda/viewer-bundle-report.html",
+    "pack": "npm run build && npm pack"
+  },
+  "dependencies": {
+    "lit": "^3.3.3"
+  },
+  "peerDependencies": {
+    "@babylonjs/core": "^9.0.0",
+    "@babylonjs/lite": "^1.23.0",
+    "@babylonjs/loaders": "^9.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@babylonjs/lite": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@babylonjs/core": "9.35.0",
+    "@babylonjs/lite": "^1.23.0",
+    "@babylonjs/loaders": "9.35.0",
+    "@dev/build-tools": "^1.0.0",
+    "@rollup/plugin-alias": "^6.0.1",
+    "@rollup/plugin-commonjs": "^29.0.3",
+    "@rollup/plugin-node-resolve": "^16.0.3",
+    "@rollup/plugin-terser": "^1.0.2",
+    "@rollup/plugin-typescript": "^12.3.1",
+    "@webgpu/types": "^0.1.74",
+    "chalk": "^6.0.1",
+    "rollup": "^4.65.1",
+    "rollup-plugin-dts": "^6.5.1",
+    "rollup-plugin-minify-template-literals": "^1.1.7",
+    "serve": "^14.2.6",
+    "sonda": "^0.14.0",
+    "vite": "8.3.5"
+  },
+  "keywords": [
+    "3D",
+    "javascript",
+    "html5",
+    "webgl",
+    "babylon.js"
+  ],
+  "license": "Apache-2.0"
+}

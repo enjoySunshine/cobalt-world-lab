@@ -1,0 +1,123 @@
+#if SCENE_MRT_COUNT > 0
+
+#ifdef ALPHATEST
+    var writeGeometryInfo: f32 = 1.0;
+#else
+    var writeGeometryInfo: f32 = select(0.0, 1.0, finalColor.a > ALPHATESTVALUE);
+#endif
+var fragData: array<vec4<f32>, SCENE_MRT_COUNT>;
+#ifdef PREPASS_MESH_BLEND_TAG
+    var meshBlendTagOutput: vec4<u32> = vec4u(0u);
+    if (writeGeometryInfo > 0.0) {
+        meshBlendTagOutput = vec4u(u32(uniforms.meshBlendTag), 0u, 0u, 0u);
+    }
+#endif
+
+#ifdef PREPASS_POSITION
+    fragData[PREPASS_POSITION_INDEX] =  vec4f(fragmentInputs.vPositionW, writeGeometryInfo);
+#endif
+
+#ifdef PREPASS_OBJECT_ID
+    fragData[PREPASS_OBJECT_ID_INDEX] = encodeObjectId(uniforms.objectId) * writeGeometryInfo;
+#endif
+
+#ifdef PREPASS_LOCAL_POSITION
+    fragData[PREPASS_LOCAL_POSITION_INDEX] = vec4f(fragmentInputs.vPosition, writeGeometryInfo);
+#endif
+
+#ifdef PREPASS_VELOCITY
+    var a: vec2f = (fragmentInputs.vCurrentPosition.xy / fragmentInputs.vCurrentPosition.w) * 0.5 + 0.5;
+    var b: vec2f = (fragmentInputs.vPreviousPosition.xy / fragmentInputs.vPreviousPosition.w) * 0.5 + 0.5;
+
+    var velocity: vec2f = abs(a - b);
+    velocity =  vec2f(pow(velocity.x, 1.0 / 3.0), pow(velocity.y, 1.0 / 3.0)) * sign(a - b) * 0.5 + 0.5;
+
+    fragData[PREPASS_VELOCITY_INDEX] =  vec4f(velocity, 0.0, writeGeometryInfo);
+#elif defined(PREPASS_VELOCITY_LINEAR)
+    var velocity : vec2f = vec2f(0.5) * ((fragmentInputs.vPreviousPosition.xy / fragmentInputs.vPreviousPosition.w) -
+                                        (fragmentInputs.vCurrentPosition.xy / fragmentInputs.vCurrentPosition.w));
+    fragData[PREPASS_VELOCITY_LINEAR_INDEX] = vec4f(velocity, 0.0, writeGeometryInfo);
+#endif
+
+#ifdef PREPASS_ALBEDO
+    fragData[PREPASS_ALBEDO_INDEX] = vec4f(surfaceAlbedo, writeGeometryInfo);
+#endif
+
+#ifdef PREPASS_ALBEDO_SQRT
+    var sqAlbedo : vec3f = sqrt(surfaceAlbedo); // for pre and post scatter
+#endif
+
+#ifdef PREPASS_IRRADIANCE_LEGACY
+    var irradiance : vec3f = finalDiffuse;
+    #ifndef UNLIT
+        #ifdef REFLECTION
+            irradiance += finalIrradiance;
+        #endif
+    #endif
+
+    #ifdef SS_SCATTERING
+        #ifdef PREPASS_COLOR
+            fragData[PREPASS_COLOR_INDEX] = vec4f(finalColor.rgb - irradiance, finalColor.a); // Split irradiance from final color
+        #endif
+        irradiance /= sqAlbedo;
+        fragData[PREPASS_IRRADIANCE_LEGACY_INDEX] = vec4f(clamp(irradiance, vec3f(0.), vec3f(1.)), writeGeometryInfo * uniforms.scatteringDiffusionProfile / 255.); // Irradiance + SS diffusion profile
+    #else
+        #ifdef PREPASS_COLOR
+            fragData[PREPASS_COLOR_INDEX] = finalColor; // No split lighting
+        #endif
+        fragData[PREPASS_IRRADIANCE_LEGACY_INDEX] = vec4f(clamp(irradiance, vec3f(0.), vec3f(1.)), writeGeometryInfo); // Irradiance + SS diffusion profile
+    #endif
+#else
+    #ifdef PREPASS_IRRADIANCE
+        var irradiance : vec3f = finalDiffuse;
+        #ifndef UNLIT
+            #ifdef REFLECTION
+                irradiance += finalIrradiance;
+            #endif
+        #endif
+        fragData[PREPASS_IRRADIANCE_INDEX] = vec4f(irradiance, writeGeometryInfo);
+    #endif
+    #ifdef PREPASS_COLOR
+        fragData[PREPASS_COLOR_INDEX] = vec4f(finalColor.rgb, finalColor.a);
+    #endif
+#endif
+
+#ifdef PREPASS_DEPTH
+    fragData[PREPASS_DEPTH_INDEX] = vec4f(fragmentInputs.vViewPos.z, 0.0, 0.0, writeGeometryInfo); // Linear depth
+#endif
+
+#ifdef PREPASS_SCREENSPACE_DEPTH
+    fragData[PREPASS_SCREENSPACE_DEPTH_INDEX] = vec4f(fragmentInputs.position.z, 0.0, 0.0, writeGeometryInfo);
+#endif
+
+#ifdef PREPASS_NORMALIZED_VIEW_DEPTH
+    fragData[PREPASS_NORMALIZED_VIEW_DEPTH_INDEX] = vec4f(fragmentInputs.vNormViewDepth, 0.0, 0.0, writeGeometryInfo);
+#endif
+
+#ifdef PREPASS_NORMAL
+    #ifdef PREPASS_NORMAL_WORLDSPACE
+        fragData[PREPASS_NORMAL_INDEX] = vec4f(normalW, writeGeometryInfo);
+    #else
+        fragData[PREPASS_NORMAL_INDEX] = vec4f(normalize((scene.view * vec4f(normalW, 0.0)).rgb), writeGeometryInfo);
+    #endif
+#endif
+
+#ifdef PREPASS_WORLD_NORMAL
+    fragData[PREPASS_WORLD_NORMAL_INDEX] = vec4f(normalW * 0.5 + 0.5, writeGeometryInfo);
+#endif
+
+#ifdef PREPASS_ALBEDO_SQRT
+    fragData[PREPASS_ALBEDO_SQRT_INDEX] = vec4f(sqAlbedo, writeGeometryInfo);
+#endif
+
+#ifdef PREPASS_REFLECTIVITY
+    #ifndef UNLIT
+        fragData[PREPASS_REFLECTIVITY_INDEX] = vec4f(specularEnvironmentR0, microSurface) * writeGeometryInfo;
+    #else
+        fragData[PREPASS_REFLECTIVITY_INDEX] = vec4f(0.0, 0.0, 0.0, 1.0) * writeGeometryInfo;
+    #endif
+#endif
+
+#include<meshBlendTagFragmentOutput>[0..8]
+
+#endif

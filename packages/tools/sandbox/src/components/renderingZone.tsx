@@ -1,0 +1,670 @@
+/* eslint-disable github/no-then */
+/* eslint-disable @typescript-eslint/no-floating-promises */
+import * as React from "react";
+import { type GlobalState } from "../globalState";
+
+import { Engine } from "core/Engines/engine";
+import { WebGPUEngine } from "core/Engines/webgpuEngine";
+import { LoadSceneAsync, SceneLoader } from "core/Loading/sceneLoader";
+import { GLTFFileLoader } from "loaders/glTF/glTFFileLoader";
+import { Scene } from "core/scene";
+import { ArcRotateCamera } from "core/Cameras/arcRotateCamera";
+import { type Camera } from "core/Cameras/camera";
+import { type FramingBehavior } from "core/Behaviors/Cameras/framingBehavior";
+import { EnvironmentTools } from "../tools/environmentTools";
+import { Tools } from "core/Misc/tools";
+import { FilesInput } from "core/Misc/filesInput";
+import { Animation } from "core/Animations/animation";
+import { CreatePlane } from "core/Meshes/Builders/planeBuilder";
+
+import "core/Helpers/sceneHelpers";
+import "core/Loading/loadingScreen";
+import "core/Culling/ray";
+
+import "../scss/renderingZone.scss";
+import { PBRBaseMaterial } from "core/Materials/PBR/pbrBaseMaterial";
+import { Texture, type ITextureCreationOptions } from "core/Materials/Textures/texture";
+import { PBRMaterial } from "core/Materials/PBR/pbrMaterial";
+import { type AbstractEngine } from "core/Engines/abstractEngine";
+import { setOpenGLOrientationForUV, useOpenGLOrientationForUV } from "core/Compat/compatibilityOptions";
+import { ImageProcessingConfiguration } from "core/Materials/imageProcessingConfiguration";
+import { LoadProjectFileAsync } from "shared-ui-components/projects/projectFile";
+import { DataStorage } from "core/Misc/dataStorage";
+import { CreateUsdFileLoaderOptionsAsync, GetInputFilePath, GetUsdRootCandidates, IsUsdSceneFile, type IUsdInputFile } from "../tools/usdFileInput";
+
+function GetFileExtension(str: string): string {
+    return str.split(".").pop() || "";
+}
+
+function IsTextureAsset(extension: string): boolean {
+    switch (extension.toLowerCase()) {
+        case "ktx":
+        case "ktx2":
+        case "png":
+        case "jpg":
+        case "jpeg":
+        case "webp": {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+function IsProjectAsset(extension: string): boolean {
+    return extension.toLowerCase() === "babylonproj";
+}
+
+interface ICameraWithMovementKeys extends Camera {
+    speed: number;
+    keysUp: number[];
+    keysDown: number[];
+    keysLeft: number[];
+    keysRight: number[];
+}
+
+function HasMovementKeys(camera: Camera): camera is ICameraWithMovementKeys {
+    const cameraWithMovementKeys = camera as Partial<ICameraWithMovementKeys>;
+    return (
+        typeof cameraWithMovementKeys.speed === "number" &&
+        Array.isArray(cameraWithMovementKeys.keysUp) &&
+        Array.isArray(cameraWithMovementKeys.keysDown) &&
+        Array.isArray(cameraWithMovementKeys.keysLeft) &&
+        Array.isArray(cameraWithMovementKeys.keysRight)
+    );
+}
+
+interface IRenderingZoneProps {
+    globalState: GlobalState;
+    expanded: boolean;
+    onEngineCreated?: (engine: AbstractEngine) => void;
+}
+
+interface IRenderingZoneState {
+    usdRootCandidates: IUsdInputFile[];
+}
+
+/**
+ * RenderingZone component
+ */
+export class RenderingZone extends React.Component<IRenderingZoneProps, IRenderingZoneState> {
+    private _currentPluginName?: string;
+    private _engine: AbstractEngine;
+    private _scene: Scene;
+    private _canvas: HTMLCanvasElement;
+    private _restoreInspector = false;
+    private _currentInputFiles: File[] = [];
+    private _filesInput?: FilesInput;
+    private _setSceneFileToLoad?: (sceneFile: File) => void;
+    private readonly _renderScene = () => {
+        const activeCamera = this._scene.activeCamera;
+        if (activeCamera instanceof ArcRotateCamera) {
+            // NOTE: this logic to adjust camera parameters based on radius is copied in viewer.ts.
+            // Please keep them in sync.
+            activeCamera.panningSensibility = 5000 / activeCamera.radius;
+            activeCamera.speed = activeCamera.radius * 0.2;
+        }
+        this._scene.render();
+    };
+
+    public constructor(props: IRenderingZoneProps) {
+        super(props);
+        this.state = { usdRootCandidates: [] };
+    }
+
+    // eslint-disable-next-line @typescript-eslint/naming-convention
+    async initEngine() {
+        const useWebGPU = location.href.indexOf("webgpu") !== -1 && !!(navigator as any).gpu;
+        const antialias = true;
+
+        this._canvas = document.getElementById("renderCanvas") as HTMLCanvasElement;
+        if (useWebGPU) {
+            this._engine = new WebGPUEngine(this._canvas, {
+                enableAllFeatures: true,
+                setMaximumLimits: true,
+                antialias,
+                useHighPrecisionMatrix: true,
+            });
+            await (this._engine as WebGPUEngine).initAsync();
+        } else {
+            this._engine = new Engine(this._canvas, antialias, {
+                useHighPrecisionMatrix: true,
+                premultipliedAlpha: false,
+                preserveDrawingBuffer: true,
+                antialias: antialias,
+            });
+        }
+
+        this.props.onEngineCreated && this.props.onEngineCreated(this._engine);
+
+        this._engine.loadingUIBackgroundColor = "#2A2342";
+
+        // Resize
+        window.addEventListener("resize", () => {
+            this._engine.resize();
+        });
+
+        this.loadAsset();
+
+        // File inputs
+        const filesInput = new FilesInput(
+            this._engine,
+            null,
+            (sceneFile: File, scene: Scene) => {
+                this._scene = scene;
+                this.onSceneLoaded(sceneFile.name);
+            },
+            null,
+            null,
+            null,
+            (files = []) => {
+                const inputFiles = Array.from(files);
+                if (inputFiles.length === 0) {
+                    this._engine.hideLoadingUI();
+                    if (this._scene && !this._scene.isDisposed) {
+                        this._engine.runRenderLoop(this._renderScene);
+                    }
+                    if (this._restoreInspector) {
+                        this._restoreInspector = false;
+                        this.props.globalState.showDebugLayer();
+                    }
+                    return;
+                }
+                this._currentInputFiles = inputFiles;
+                this._setSceneFileToLoad = undefined;
+                this.setState({ usdRootCandidates: [] });
+                Tools.ClearLogCache();
+                if (this._scene) {
+                    if (this.props.globalState.isDebugLayerEnabled) {
+                        this.props.globalState.hideDebugLayer();
+                        this._restoreInspector = true;
+                    }
+                }
+            },
+            () => {
+                this._requestFilesInputReload();
+            },
+            (file, scene, message) => {
+                this.props.globalState.onError.notifyObservers({ message: message });
+            },
+            false,
+            true
+        );
+        this._filesInput = filesInput;
+        filesInput.onProcessFilesErrorCallback = () => {
+            this._cancelUsdRootSelection();
+        };
+
+        filesInput.onProcessFileCallback = (file, name, extension, setSceneFileToLoad) => {
+            this._setSceneFileToLoad = setSceneFileToLoad;
+            if (filesInput.filesToLoad && filesInput.filesToLoad.length === 1 && extension) {
+                switch (extension.toLowerCase()) {
+                    case "dds":
+                    case "env":
+                    case "exr":
+                    case "hdr": {
+                        FilesInput.FilesToLoad[name] = file;
+                        EnvironmentTools.SkyboxPath = "file:" + (file as any).correctName;
+                        EnvironmentTools.ResetEnvironmentTexture();
+                        return false;
+                    }
+                    default: {
+                        if (IsTextureAsset(extension) || IsProjectAsset(extension)) {
+                            setSceneFileToLoad(file);
+                        }
+
+                        break;
+                    }
+                }
+            }
+
+            return true;
+        };
+
+        filesInput.loadAsync = async (sceneFile, onProgress) => {
+            const sceneFileName = GetInputFilePath(sceneFile);
+            const sceneFileExtension = GetFileExtension(sceneFileName);
+            if (IsProjectAsset(sceneFileExtension)) {
+                const scene = new Scene(this._engine);
+                try {
+                    await LoadProjectFileAsync(scene, sceneFile);
+                } catch (error) {
+                    scene.dispose();
+                    throw error;
+                }
+                return scene;
+            }
+
+            const filesToLoad = filesInput.filesToLoad;
+            if (filesToLoad.length === 1) {
+                const fileName = (filesToLoad[0] as any).correctName as string;
+                const fileExtension = GetFileExtension(fileName);
+                if (IsTextureAsset(fileExtension)) {
+                    return await Promise.resolve(this.loadTextureAsset(`file:${fileName}`));
+                }
+            }
+
+            this._engine.clearInternalTexturesCache();
+
+            if (IsUsdSceneFile(sceneFileName)) {
+                const usdOptions = await CreateUsdFileLoaderOptionsAsync(this._currentInputFiles, sceneFile);
+                return await LoadSceneAsync(sceneFile, this._engine, {
+                    onProgress: onProgress ?? undefined,
+                    pluginOptions: { usd: usdOptions },
+                });
+            }
+
+            return await SceneLoader.LoadAsync("file:", sceneFile, this._engine, onProgress);
+        };
+
+        filesInput.monitorElementForDragNDrop(this._canvas);
+
+        this.props.globalState.filesInput = filesInput;
+        this.props.globalState.onFilesInputReady.notifyObservers();
+
+        window.addEventListener("keydown", (event) => {
+            // Press R to reload
+            if (event.keyCode === 82 && event.target && (event.target as HTMLElement).nodeName !== "INPUT" && this._scene && this.state.usdRootCandidates.length === 0) {
+                if (this.props.globalState.assetUrl) {
+                    this.loadAssetFromUrl(this.props.globalState.assetUrl);
+                } else {
+                    filesInput.reload();
+                }
+            }
+        });
+    }
+
+    private _requestFilesInputReload(): void {
+        const usdRootCandidates = GetUsdRootCandidates(this._currentInputFiles);
+        if (usdRootCandidates.length > 0 && !SceneLoader.IsPluginForExtensionAvailable(".usd")) {
+            this._cancelUsdRootSelection();
+            return;
+        }
+        if (usdRootCandidates.length > 1) {
+            this._restoreCurrentSceneRendering();
+            this.setState({ usdRootCandidates });
+            return;
+        }
+
+        this._reloadFilesInput(usdRootCandidates[0]?.file);
+    }
+
+    private _reloadFilesInput(usdRootFile?: File): void {
+        if (usdRootFile) {
+            this._setSceneFileToLoad?.(usdRootFile);
+        }
+        this.setState({ usdRootCandidates: [] });
+
+        // FilesInput does not know about scenes loaded from a URL, so stop their render loop explicitly.
+        this._engine.stopRenderLoop();
+        this._filesInput?.reload();
+    }
+
+    private _restoreCurrentSceneRendering(): void {
+        this._engine.hideLoadingUI();
+        if (this._scene && !this._scene.isDisposed) {
+            this._engine.runRenderLoop(this._renderScene);
+        }
+    }
+
+    private _cancelUsdRootSelection(): void {
+        this._currentInputFiles = [];
+        this._setSceneFileToLoad = undefined;
+        (this._filesInput as (FilesInput & { clearFileSelection?: (cancelActiveLoad?: boolean) => void }) | undefined)?.clearFileSelection?.(false);
+        this.setState({ usdRootCandidates: [] });
+        this._restoreCurrentSceneRendering();
+        if (this._restoreInspector) {
+            this._restoreInspector = false;
+            this.props.globalState.showDebugLayer();
+        }
+    }
+
+    prepareCamera() {
+        let camera = this._scene.activeCamera as ArcRotateCamera;
+        // Attach camera to canvas inputs
+        if (!camera) {
+            this._scene.createDefaultCamera(true);
+
+            camera = this._scene.activeCamera! as ArcRotateCamera;
+
+            if (this._currentPluginName === "gltf" || this._currentPluginName === "obj" || this._currentPluginName === "fbx") {
+                // glTF assets use a +Z forward convention while the default camera faces +Z. Rotate the camera to look at the front of the asset.
+                // We do this same for obj as it matches other viewers, but obj does not specify a forward convention.
+                // The FBX loader applies the same right-handed-to-left-handed flip as glTF, so its assets share the +Z forward convention.
+                camera.alpha += Math.PI;
+            }
+
+            // Enable camera's behaviors
+            camera.useFramingBehavior = true;
+
+            const framingBehavior = camera.getBehaviorByName("Framing") as FramingBehavior;
+            framingBehavior.framingTime = 0;
+            framingBehavior.elevationReturnTime = -1;
+
+            if (this._scene.meshes.length) {
+                camera.lowerRadiusLimit = null;
+
+                const worldExtends = this._scene.getWorldExtends(function (mesh) {
+                    return mesh.isVisible && mesh.isEnabled();
+                });
+                framingBehavior.zoomOnBoundingInfo(worldExtends.min, worldExtends.max);
+            }
+
+            if (this.props.globalState.autoRotate) {
+                camera.useAutoRotationBehavior = true;
+            }
+
+            camera.pinchPrecision = 200 / camera.radius;
+            camera.upperRadiusLimit = 5 * camera.radius;
+
+            camera.wheelDeltaPercentage = 0.01;
+            camera.pinchDeltaPercentage = 0.01;
+
+            if (this.props.globalState.cameraPosition) {
+                camera.lowerRadiusLimit = null;
+                camera.setPosition(this.props.globalState.cameraPosition);
+                camera.lowerRadiusLimit = camera.radius;
+            }
+        }
+
+        camera.attachControl();
+        return camera;
+    }
+
+    private _configureMovementControls(camera: Camera, speed: number): void {
+        if (HasMovementKeys(camera)) {
+            camera.speed = speed;
+            camera.keysUp.push(90); // Z
+            camera.keysUp.push(87); // W
+            camera.keysDown.push(83); // S
+            camera.keysLeft.push(65); // A
+            camera.keysLeft.push(81); // Q
+            camera.keysRight.push(69); // E
+            camera.keysRight.push(68); // D
+        }
+    }
+
+    handleErrors(preparedCamera: ArcRotateCamera) {
+        // In case of error during loading, meshes will be empty and clearColor is set to red
+        if (this._scene.meshes.length === 0 && this._scene.clearColor.r === 1 && this._scene.clearColor.g === 0 && this._scene.clearColor.b === 0) {
+            this._canvas.style.opacity = "0";
+            this.props.globalState.onError.notifyObservers({ scene: this._scene, message: "No mesh found in your scene" });
+        } else {
+            if (Tools.errorsCount > 0) {
+                this.props.globalState.onError.notifyObservers({ scene: this._scene, message: "Scene loaded but several errors were found" });
+            }
+            //    this._canvas.style.opacity = "1";
+            this._configureMovementControls(preparedCamera, preparedCamera.speed);
+            if (this._scene.activeCamera && this._scene.activeCamera !== preparedCamera) {
+                this._configureMovementControls(this._scene.activeCamera, preparedCamera.speed);
+            }
+        }
+    }
+
+    prepareLighting() {
+        if (this._currentPluginName === "gltf") {
+            if (!this._scene.environmentTexture) {
+                this._scene.environmentTexture = EnvironmentTools.LoadSkyboxPathTexture(this._scene);
+            }
+
+            if (this._scene.environmentTexture && this.props.globalState.skybox) {
+                const camera = this._scene.activeCamera!;
+                const skyboxSize = (camera.maxZ - camera.minZ) / 2;
+                const skybox = this._scene.createDefaultSkybox(this._scene.environmentTexture, true, skyboxSize, 0.3, false);
+                if (skybox) {
+                    this._scene.onActiveCameraChanged.add((scene) => {
+                        if (scene.activeCamera) {
+                            skybox.scaling.setAll((scene.activeCamera.maxZ - scene.activeCamera.minZ) / 2 / skyboxSize);
+                        }
+                    });
+                }
+            }
+        } else {
+            let pbrPresent = false;
+            for (const material of this._scene.materials) {
+                if (material instanceof PBRBaseMaterial) {
+                    pbrPresent = true;
+                    break;
+                }
+            }
+
+            if (pbrPresent) {
+                if (!this._scene.environmentTexture) {
+                    this._scene.environmentTexture = EnvironmentTools.LoadSkyboxPathTexture(this._scene);
+                }
+            } else {
+                this._scene.createDefaultLight();
+            }
+        }
+    }
+
+    onSceneLoaded(filename: string) {
+        this._scene.skipFrustumClipping = true;
+
+        if (this.props.globalState.toneMapping !== undefined) {
+            this._scene.imageProcessingConfiguration.toneMappingEnabled = true;
+            this._scene.imageProcessingConfiguration.toneMappingType = this.props.globalState.toneMapping;
+        } else if (this.props.globalState.commerceMode) {
+            this._scene.imageProcessingConfiguration.toneMappingEnabled = true;
+            this._scene.imageProcessingConfiguration.toneMappingType = ImageProcessingConfiguration.TONEMAPPING_KHR_PBR_NEUTRAL;
+        }
+
+        this.props.globalState.onSceneLoaded.notifyObservers({ scene: this._scene, filename: filename });
+
+        // The FBX loader creates animation groups but does not auto-play them the way the glTF loader does.
+        // Treat FBX assets like glTF in the Sandbox by playing the first animation group (looped) on load.
+        if (this._currentPluginName === "fbx" && this._scene.animationGroups.length > 0) {
+            this._scene.animationGroups[0].start(true);
+        }
+
+        const camera = this.prepareCamera();
+        const requestedCamera = this.props.globalState.cameraIndex === undefined ? undefined : this._scene.cameras[this.props.globalState.cameraIndex];
+        if (requestedCamera && requestedCamera !== camera) {
+            camera.detachControl();
+            this._scene.activeCamera = requestedCamera;
+            requestedCamera.attachControl();
+        }
+        this.prepareLighting();
+        this.handleErrors(camera);
+
+        if (this._restoreInspector) {
+            this._restoreInspector = false;
+            this.props.globalState.showDebugLayer();
+        }
+
+        this._scene.executeWhenReady(() => {
+            this._engine.runRenderLoop(this._renderScene);
+        });
+
+        delete this._currentPluginName;
+    }
+
+    loadTextureAsset(url: string): Scene {
+        const scene = new Scene(this._engine);
+
+        const prevousUseOpenGLOrientationForUV = useOpenGLOrientationForUV;
+        setOpenGLOrientationForUV(true);
+        const plane = CreatePlane("plane", { size: 1 }, scene);
+        setOpenGLOrientationForUV(prevousUseOpenGLOrientationForUV);
+
+        const options: ITextureCreationOptions = {
+            invertY: false,
+            samplingMode: Texture.NEAREST_LINEAR,
+            onLoad: () => {
+                const size = texture.getBaseSize();
+                if (size.width > size.height) {
+                    plane.scaling.y = size.height / size.width;
+                } else {
+                    plane.scaling.x = size.width / size.height;
+                }
+
+                texture.gammaSpace = true;
+                texture.hasAlpha = true;
+                texture.wrapU = Texture.CLAMP_ADDRESSMODE;
+                texture.wrapV = Texture.CLAMP_ADDRESSMODE;
+
+                if (scene.debugLayer) {
+                    scene.debugLayer.show(); // eslint-disable-line @typescript-eslint/no-floating-promises
+                    scene.debugLayer.select(texture, "PREVIEW");
+                }
+            },
+            onError: (message, exception) => {
+                this.props.globalState.onError.notifyObservers({ scene: scene, message: message || exception.message || "Failed to load texture" });
+            },
+        };
+
+        const texture = new Texture(url, scene, options);
+        const material = new PBRMaterial("unlit", scene);
+        material.unlit = true;
+        material.albedoTexture = texture;
+        material.alphaMode = PBRMaterial.PBRMATERIAL_ALPHABLEND;
+        plane.material = material;
+
+        return scene;
+    }
+
+    loadAssetFromUrl(assetUrl: string) {
+        const rootUrl = Tools.GetFolderPath(assetUrl);
+        const fileName = Tools.GetFilename(assetUrl);
+        // Strip any query string / hash fragment before detecting the extension and
+        // naming the bundled File. Signed asset URLs (e.g. "scene.babylonproj?sig=...")
+        // would otherwise defeat extension detection and produce awkward file names.
+        const cleanFileName = fileName.split(/[?#]/)[0] || fileName;
+        const fileExtension = GetFileExtension(cleanFileName);
+
+        this._engine.clearInternalTexturesCache();
+
+        const promise = IsTextureAsset(fileExtension)
+            ? Promise.resolve(this.loadTextureAsset(assetUrl))
+            : IsProjectAsset(fileExtension)
+              ? (async () => {
+                    const response = await fetch(assetUrl);
+                    if (!response.ok) {
+                        throw new Error(`Unable to load ${cleanFileName}: ${response.statusText}`);
+                    }
+                    const projectBlob = await response.blob();
+                    const scene = new Scene(this._engine);
+                    const projectFile = new File([projectBlob], cleanFileName, { type: projectBlob.type || "application/octet-stream" });
+                    try {
+                        await LoadProjectFileAsync(scene, projectFile);
+                    } catch (error) {
+                        scene.dispose();
+                        throw error;
+                    }
+                    return scene;
+                })()
+              : SceneLoader.LoadAsync(rootUrl, fileName, this._engine);
+
+        promise
+            .then((scene) => {
+                if (this._scene) {
+                    this._scene.dispose();
+                }
+
+                this._scene = scene;
+
+                this.onSceneLoaded(cleanFileName);
+            })
+            .catch((reason) => {
+                this.props.globalState.onError.notifyObservers({ message: reason.message });
+            });
+    }
+
+    loadAsset() {
+        if (this.props.globalState.assetUrl) {
+            this.loadAssetFromUrl(this.props.globalState.assetUrl);
+            return;
+        }
+    }
+
+    override componentDidMount() {
+        if (!Engine.isSupported()) {
+            return;
+        }
+
+        Engine.ShadersRepository = "/src/Shaders/";
+
+        // This is really important to tell Babylon.js to use decomposeLerp and matrix interpolation
+        Animation.AllowMatricesInterpolation = true;
+
+        // Setting up some GLTF values
+        GLTFFileLoader.IncrementalLoading = false;
+        this.props.globalState.glTFLoaderExtensions = {};
+        SceneLoader.OnPluginActivatedObservable.add((plugin) => {
+            this._currentPluginName = plugin.name;
+            if (this._currentPluginName === "gltf") {
+                const loader = plugin as GLTFFileLoader;
+                loader.transparencyAsCoverage = this.props.globalState.commerceMode;
+
+                loader.validate = true;
+
+                // This intentionally relies on an internal Inspector storage contract. Sandbox
+                // and Inspector are separate bundles, so they cannot currently share the service
+                // that applies these options. Keep this in sync with GLTFLoaderOptionsServiceDefinition
+                // and do not replicate this cross-bundle coupling elsewhere without careful consideration.
+                // Apply glTF loader options persisted by the inspector (e.g. useOpenPBR).
+                // The inspector's GLTFLoaderOptionsService applies these via its own
+                // OnPluginActivatedObservable subscription, but that subscription is only
+                // registered when the inspector is first opened. This read ensures persisted
+                // settings are applied even on the initial page load before the inspector opens.
+                // Key format mirrors SettingsStore: Babylon/<namespace>/<settingKey>.
+                const inspectorLoaderOptions = DataStorage.ReadJson<Record<string, unknown>>("Babylon/Inspector/glTFLoaderOptions", {});
+                for (const [key, value] of Object.entries(inspectorLoaderOptions)) {
+                    if (value !== null) {
+                        (loader as unknown as Record<string, unknown>)[key] = value;
+                    }
+                }
+
+                loader.onExtensionLoadedObservable.add((extension: import("loaders/glTF/index").IGLTFLoaderExtension) => {
+                    this.props.globalState.glTFLoaderExtensions[extension.name] = extension;
+                });
+
+                loader.onValidatedObservable.add((results) => {
+                    if (results.issues.numErrors > 0) {
+                        this.props.globalState.showDebugLayer();
+                    }
+                });
+            }
+        });
+
+        this.initEngine();
+    }
+
+    override shouldComponentUpdate(nextProps: IRenderingZoneProps, nextState: IRenderingZoneState) {
+        if (nextProps.expanded !== this.props.expanded || nextState.usdRootCandidates !== this.state.usdRootCandidates) {
+            setTimeout(() => this._engine.resize());
+            return true;
+        }
+        return false;
+    }
+
+    public override render() {
+        return (
+            <div id="canvasZone" className={this.props.expanded ? "expanded" : ""}>
+                <canvas id="renderCanvas" touch-action="none" onContextMenu={(evt) => evt.preventDefault()}></canvas>
+                {this.state.usdRootCandidates.length > 1 && (
+                    <div id="usdRootSelectionPrompt">
+                        <div className="prompt-content">
+                            <p>
+                                <strong>Select the root USD layer</strong>
+                            </p>
+                            <p>This file set contains multiple USD layers. Select the layer that should be opened as the scene.</p>
+                            <div className="prompt-file-list">
+                                {this.state.usdRootCandidates.map((candidate) => (
+                                    <button type="button" key={candidate.path} onClick={() => this._reloadFilesInput(candidate.file)}>
+                                        {candidate.path}
+                                    </button>
+                                ))}
+                            </div>
+                            <div className="prompt-buttons">
+                                <button type="button" onClick={() => this._cancelUsdRootSelection()}>
+                                    Cancel
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                )}
+            </div>
+        );
+    }
+}

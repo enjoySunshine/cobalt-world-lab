@@ -1,0 +1,18 @@
+{
+  "name": "babylonjs-gltf2interface",
+  "description": "A typescript declaration of babylon's gltf2 interface.",
+  "version": "9.35.0",
+  "files": [
+    "babylon.glTF2Interface.d.ts",
+    "license.md"
+  ],
+  "typings": "babylon.glTF2Interface.d.ts",
+  "keywords": [
+    "3D",
+    "javascript",
+    "html5",
+    "webgl",
+    "gltf2"
+  ],
+  "license": "Apache-2.0"
+}

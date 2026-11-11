@@ -1,0 +1,47 @@
+{
+    "name": "@tools/viewer",
+    "version": "1.0.0",
+    "private": true,
+    "sideEffects": false,
+    "description": "A viewer using BabylonJS to display 3D elements natively",
+    "scripts": {
+        "start:web": "npm run serve -- --open packages/tools/viewer/test/apps/web/index.html",
+        "start:analyze": "npm run bundle:analyze && npm run serve -- --open packages/tools/viewer/test/apps/web/analyze.html",
+        "start:coverage": "npm run bundle:analyze && npm run instrument && npm run serve -- --open packages/tools/viewer/test/apps/web/coverage.html",
+        "serve": "cross-env COVERAGE_DIR=dist/coverage/raw vite",
+        "build": "npm run compile",
+        "clean": "rimraf dist && rimraf *.tsbuildinfo -g",
+        "compile": "tsc -b tsconfig.build.json",
+        "watch": "npm run compile -- -w",
+        "watch:dev": "npm run watch",
+        "bundle:analyze": "rimraf dist/analyze && rollup -c rollup.config.analyze.mjs",
+        "bundle:coverage": "rimraf dist/coverage && rollup -c rollup.config.coverage.mjs",
+        "analyze": "npm run bundle:analyze && node ../../../scripts/folderSizeFlameChart.mjs dist/analyze \"**/*.js\" dist/analyze/flameChart",
+        "import-chains": "node -e \"require('../../../scripts/queryRollupStats.js').queryRollupStats(process.argv[1], process.argv[2], 'dist/analyze/stats.json')\"",
+        "instrument": "npm run bundle:coverage && nyc --exclude-node-modules=false instrument dist/coverage/original dist/coverage/instrumented",
+        "report-coverage": "node generateCoverageReports.mjs dist/analyze dist/coverage dist/coverage/original dist/coverage/raw",
+        "test": "echo \"Error: no test specified\" && exit 1"
+    },
+    "dependencies": {
+        "@babylonjs/lite": "^1.23.0",
+        "@dev/core": "1.0.0",
+        "@dev/loaders": "1.0.0",
+        "lit": "^3.3.3"
+    },
+    "devDependencies": {
+        "@rollup/plugin-alias": "^6.0.1",
+        "@rollup/plugin-commonjs": "^29.0.3",
+        "@rollup/plugin-node-resolve": "^16.0.3",
+        "@rollup/plugin-terser": "^1.0.2",
+        "@rollup/plugin-typescript": "^12.3.1",
+        "@webgpu/types": "^0.1.74",
+        "chalk": "^6.0.1",
+        "cross-env": "^10.1.0",
+        "nyc": "^18.0.0",
+        "open": "^11.0.4",
+        "rollup": "^4.65.1",
+        "rollup-plugin-minify-template-literals": "^1.1.7",
+        "rollup-plugin-visualizer": "^7.1.1",
+        "vite": "8.3.5"
+    }
+}

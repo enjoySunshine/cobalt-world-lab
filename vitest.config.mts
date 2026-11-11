@@ -1,0 +1,133 @@
+import { defineConfig } from "vitest/config";
+import { transformWithEsbuild } from "vite";
+import * as fs from "fs";
+import { createRequire } from "module";
+import * as path from "path";
+import { fileURLToPath } from "url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+const compilerOptions = JSON.parse(fs.readFileSync(path.resolve(__dirname, "./tsconfig.json"), "utf8")).compilerOptions;
+
+/**
+ * Convert tsconfig paths to Vitest resolve aliases
+ */
+const convertPathsToAliases = () => {
+    const aliases: Record<string, string> = {};
+    const paths = compilerOptions.paths;
+    for (const key in paths) {
+        // Convert glob patterns to regex-compatible aliases
+        const aliasKey = key.replace("/*", "");
+        // tsconfig `paths` values are repo-root-relative (e.g. "./packages/dev/core/src/*"),
+        // so resolve them against __dirname directly rather than prepending "packages".
+        const aliasValue = path.resolve(__dirname, paths[key][0].replace("/*", ""));
+        aliases[aliasKey] = aliasValue;
+    }
+    return aliases;
+};
+
+const aliases = convertPathsToAliases();
+
+// babylonjs-gltf2interface is a types-only package (const enums inlined by
+// TypeScript at compile time). It has no JS entry point, so Vite's resolver
+// cannot find one. Provide a runtime stub so glTF loader tests can import
+// modules that reference this package.
+const gltf2InterfaceStub = path.resolve(__dirname, "packages/public/glTF2Interface/babylonjs-gltf2interface.stub.ts");
+
+// Tabster has an ESM entry but no exports map, so Vitest otherwise loads its CommonJS entry as ESM.
+const tabsterEsmEntry = createRequire(import.meta.url).resolve("tabster/dist/esm/index.js");
+
+const createProjectConfig = (type: string) => {
+    const globalSetupLocation = path.resolve(".", `vitest.${type}.setup.ts`);
+    const setupFileLocation = path.resolve(".", `vitest.${type}.setup.afterEnv.ts`);
+    const globalSetup = fs.existsSync(globalSetupLocation) ? globalSetupLocation : undefined;
+    const setupFiles: string[] = [path.resolve(".", "vitest.setup.ts")];
+    if (fs.existsSync(setupFileLocation)) {
+        setupFiles.push(setupFileLocation);
+    }
+
+    return {
+        name: type,
+        include: [`packages/**/test/${type}/**/*.test.{ts,tsx}`],
+        exclude: ["**/node_modules/**", "**/packages/*/src/**"],
+        globals: true,
+        environment: "node",
+        // Use child processes (like Jest) instead of worker threads.
+        // Babylon.js has deep side-effect import chains (shaders, scene
+        // components) that resolve asynchronously. With the default 'threads'
+        // pool, pending module resolution can outlive the test and cause
+        // EnvironmentTeardownError. Forked processes exit cleanly.
+        pool: "forks",
+        globalSetup,
+        setupFiles,
+    };
+};
+
+// TC39 decorators migration: with experimentalDecorators removed, the source uses TC39 Stage 3
+// decorators plus the `accessor` keyword. Vite 8 transforms via Oxc (through Rolldown), but Oxc only
+// lowers *legacy* (experimental) decorators — with TC39 Stage 3 decorators it leaves
+// `@decorator`/`accessor` untransformed, which Node cannot parse ("SyntaxError: Invalid or unexpected
+// token"). esbuild does lower TC39 decorators, so we disable Oxc (`oxc: false`) and run a `pre`
+// plugin that transforms every TS/TSX source with esbuild before Rolldown processes it.
+// `useDefineForClassFields: false` keeps assignment (not define) class-field semantics so type-only
+// field redeclarations do not clobber values that a base constructor assigned.
+const esbuildTransformOptions = {
+    target: "es2021" as const,
+    tsconfigRaw: {
+        compilerOptions: {
+            useDefineForClassFields: false,
+        },
+    },
+};
+
+const esbuildDecoratorPlugin = {
+    name: "babylon-esbuild-tc39-decorators",
+    enforce: "pre" as const,
+    async transform(code: string, id: string) {
+        const filePath = id.split("?")[0];
+        if (!/\.tsx?$/.test(filePath) || filePath.includes("/node_modules/")) {
+            return null;
+        }
+        const result = await transformWithEsbuild(code, id, esbuildTransformOptions);
+        return { code: result.code, map: result.map };
+    },
+};
+
+export default defineConfig({
+    oxc: false,
+    plugins: [esbuildDecoratorPlugin],
+    resolve: {
+        alias: {
+            ...aliases,
+            "babylonjs-gltf2interface": gltf2InterfaceStub,
+        },
+        extensions: [".ts", ".tsx", ".js", ".jsx", ".json"],
+    },
+    test: {
+        globals: true,
+        clearMocks: false,
+        environment: "node",
+        reporters: process.env.CI ? ["default", "junit"] : ["default"],
+        outputFile: process.env.CI ? { junit: "./junit.xml" } : undefined,
+        projects: [
+            {
+                test: createProjectConfig("unit"),
+                resolve: {
+                    alias: {
+                        tabster: tabsterEsmEntry,
+                    },
+                },
+                environments: {
+                    ssr: {
+                        resolve: {
+                            noExternal: [/@fluentui/],
+                        },
+                    },
+                },
+            },
+            // Integration, performance, and interactions tests require a browser
+            // (Puppeteer/Playwright) and are run separately via Playwright configs.
+            // They are not included here to avoid "page is not defined" errors.
+        ],
+    },
+});

@@ -1,0 +1,1029 @@
+import { type GlobalState, type SceneReferenceLocation } from "./globalState";
+import { ExportKhrInteractivityAsset } from "./khrGlbBehaviorAuthoring";
+import { type Nullable } from "core/types";
+import { type GraphFrame } from "shared-ui-components/nodeGraphSystem/graphFrame";
+import { GetFlowGraphBlockNodeId } from "./graphSystem/blockNodeData";
+import { type FlowGraph } from "core/FlowGraph/flowGraph";
+import { type FlowGraphBlock } from "core/FlowGraph/flowGraphBlock";
+import { FlowGraphCoordinator, type IFlowGraphCoordinatorConfiguration } from "core/FlowGraph/flowGraphCoordinator";
+import { type IFlowGraphSoundAsset } from "core/FlowGraph/flowGraphSoundAssets";
+import { ParseFlowGraphAsync } from "core/FlowGraph/flowGraphParser";
+import { type Scene } from "core/scene";
+import { Logger } from "core/Misc/logger";
+import { Constants } from "core/Engines/constants";
+import { type ISerializedFlowGraph } from "core/FlowGraph/typeDefinitions";
+import { FetchSnippet, type ISnippetServerResponse } from "@tools/snippet-loader";
+import {
+    type _CaptureKHRInteractivityRuntimeInputDefaults,
+    type CreateKHRInteractivityExportPlan,
+    type IKHRInteractivityExportAnalysis,
+    type KHRInteractivityExportPlan,
+} from "loaders/glTF/2.0/Extensions/KHR_interactivity.pure";
+
+function _CreateKhrExportError(diagnostics: IKHRInteractivityExportAnalysis["diagnostics"]): Error & { diagnostics: IKHRInteractivityExportAnalysis["diagnostics"] } {
+    const error = new Error(diagnostics.map((diagnostic) => `${diagnostic.path}: ${diagnostic.message}`).join("\n")) as Error & {
+        diagnostics: IKHRInteractivityExportAnalysis["diagnostics"];
+    };
+    error.name = "KHRInteractivityExportError";
+    error.diagnostics = diagnostics;
+    return error;
+}
+
+function _CreateKhrExportPlan(
+    flowGraphs: Parameters<typeof CreateKHRInteractivityExportPlan>[0],
+    options: Parameters<typeof CreateKHRInteractivityExportPlan>[1]
+): KHRInteractivityExportPlan {
+    const factory = (globalThis as any).BABYLON?.GLTF2?.Loader?.Extensions?.CreateKHRInteractivityExportPlan as typeof CreateKHRInteractivityExportPlan | undefined;
+    if (!factory) {
+        throw new Error("CreateKHRInteractivityExportPlan is not available.");
+    }
+    return factory(flowGraphs, options);
+}
+
+function _CaptureKhrInteractivityRuntimeInputDefaults(flowGraph: Parameters<typeof _CaptureKHRInteractivityRuntimeInputDefaults>[0]): void {
+    const capture = (globalThis as any).BABYLON?.GLTF2?.Loader?.Extensions?._CaptureKHRInteractivityRuntimeInputDefaults as
+        typeof _CaptureKHRInteractivityRuntimeInputDefaults | undefined;
+    if (!capture) {
+        throw new Error("_CaptureKHRInteractivityRuntimeInputDefaults is not available.");
+    }
+    capture(flowGraph);
+}
+
+function _CreateKhrExportPlanForImport(globalState: GlobalState): KHRInteractivityExportPlan | undefined {
+    const coordinator = globalState.coordinator;
+    const importResult = globalState.khrInteractivityImportResult;
+    if (!coordinator || !importResult || (importResult.scene && globalState.sceneContext?.scene !== importResult.scene)) {
+        return undefined;
+    }
+    const options: Parameters<typeof CreateKHRInteractivityExportPlan>[1] = {
+        document: importResult.document,
+        sourceGLTF: importResult.glTF,
+        preserveSourceDocument: !!(globalState.sourceGlb || globalState.sourceGltf),
+        defaultGraphIndex: importResult.document.defaultGraphIndex,
+        required: importResult.glTF.extensionsRequired?.includes("KHR_interactivity") ?? false,
+    };
+    const preliminaryPlan = _CreateKhrExportPlan(coordinator.flowGraphs, options);
+    const additionalExtensionsRequired = (importResult.glTF.extensionsRequired ?? []).filter(
+        (extensionName) => extensionName !== "KHR_interactivity" && preliminaryPlan.additionalExtensionsUsed.includes(extensionName)
+    );
+    return additionalExtensionsRequired.length > 0 ? _CreateKhrExportPlan(coordinator.flowGraphs, { ...options, additionalExtensionsRequired }) : preliminaryPlan;
+}
+
+/**
+ * Runtime settings used when deserializing graphs into an editor coordinator.
+ */
+export interface IFlowGraphEditorDeserializeOptions {
+    /** Coordinator configuration supplied by the graph's host format. */
+    coordinatorConfig?: Omit<IFlowGraphCoordinatorConfiguration, "scene">;
+    /** Whether custom events are dispatched synchronously. */
+    dispatchEventsSynchronously?: boolean;
+    /** Identifies a KHR_interactivity import that supplies its required runtime services. */
+    sourceFormat?: "KHR_interactivity";
+}
+
+/**
+ * Fully parsed coordinator state that has not yet been installed in the editor.
+ */
+export interface IFlowGraphEditorDeserializedState {
+    /** Parsed coordinator. The caller owns it until the state is installed. */
+    coordinator: FlowGraphCoordinator;
+    /** Graph index to activate when the state is installed. */
+    activeGraphIndex: number;
+    /** Reason serialization should be disabled for this state, or null. */
+    serializationDisabledReason: Nullable<string>;
+    /** Whether the coordinator depends on runtime services scoped to its imported asset. */
+    hasImportScopedRuntime: boolean;
+    /** Optional scene snippet identifier stored in the source. */
+    sceneSnippetId?: string;
+    /** Optional Flow Graph snippet identifier stored in the source. */
+    flowGraphSnippetId?: string;
+    /** Sound declarations that could not be loaded. */
+    soundAssetLoadErrors: string[];
+    /** Durable scene-reference provenance restored before graph activation. */
+    referenceProvenance: Array<[number, SceneReferenceLocation]>;
+    /** Provenance paired with exact parsed reference occurrences. */
+    referenceOccurrences: Array<[object, SceneReferenceLocation]>;
+}
+
+/**
+ * Provides serialization and deserialization utilities for the flow graph editor.
+ */
+export class SerializationTools {
+    private static readonly _KhrPersistenceDisabledReason = "KHR_interactivity graphs use import-scoped runtime services and cannot be saved to or reloaded from Flow Graph JSON.";
+
+    /**
+     * Gets the reason serialization is disabled for the current editor state.
+     * @param globalState editor state to inspect
+     * @returns the reason serialization is disabled, or null when serialization is supported
+     */
+    public static GetSerializationDisabledReason(globalState: GlobalState): Nullable<string> {
+        return globalState.serializationDisabledReason;
+    }
+
+    /**
+     * Update the editor-data locations for every block in the graph.
+     * @param flowGraph - the flow graph whose blocks to update
+     * @param globalState - the editor's global state
+     * @param frame - optional graph frame to restrict to
+     */
+    public static UpdateLocations(flowGraph: FlowGraph, globalState: GlobalState, frame?: Nullable<GraphFrame>) {
+        const shouldZoomToFitOnLoad = !!(flowGraph as any)._editorData?.zoomToFitOnLoad;
+        const editorData: any = {
+            locations: [],
+        };
+
+        // Gather all blocks from the graph
+        const blocks: FlowGraphBlock[] = [];
+        if (frame) {
+            frame.nodes.forEach((n) => blocks.push(n.content.data));
+        } else {
+            blocks.push(...flowGraph.getAllBlocks());
+        }
+
+        for (const block of blocks) {
+            const node = globalState.onGetNodeFromBlock?.(block);
+
+            editorData.locations.push({
+                blockId: block.uniqueId,
+                x: node ? node.x : 0,
+                y: node ? node.y : 0,
+                isCollapsed: node ? node.isCollapsed : false,
+            });
+        }
+
+        globalState.storeEditorData(editorData, frame);
+        editorData.map = {};
+        for (const block of blocks) {
+            const numericId = GetFlowGraphBlockNodeId(block.uniqueId);
+            editorData.map[block.uniqueId] = numericId;
+            editorData.map[numericId] = numericId;
+        }
+        if (shouldZoomToFitOnLoad) {
+            editorData.zoomToFitOnLoad = true;
+        }
+
+        // Persist editor data on the flow graph so it survives serialization round-trips
+        (flowGraph as any)._editorData = editorData;
+    }
+
+    /**
+     * Inject saved context snapshots into a serialization object when the graph
+     * has no live execution contexts (e.g. graph is stopped).
+     * @param serializationObject - the serialized flow graph data
+     * @param globalState - the editor's global state holding saved snapshots
+     */
+    public static InjectSavedContexts(serializationObject: any, globalState: GlobalState): void {
+        if (
+            (!serializationObject.executionContexts || serializationObject.executionContexts.length === 0) &&
+            globalState.savedContextSnapshots &&
+            globalState.savedContextSnapshots.length > 0
+        ) {
+            serializationObject.executionContexts = globalState.savedContextSnapshots;
+        }
+    }
+
+    /**
+     * Serialize all graphs in the coordinator to a JSON string.
+     * Produces the coordinator-level format: `{ _flowGraphs: [...], activeGraphIndex, ... }`.
+     * Falls back to serializing the single active graph if no coordinator is set.
+     * @param flowGraph - the currently active flow graph (used for single-graph fallback and UpdateLocations)
+     * @param globalState - the editor's global state
+     * @param frame - optional graph frame to restrict to
+     * @returns a JSON string representing the serialized coordinator
+     */
+    public static Serialize(flowGraph: FlowGraph, globalState: GlobalState, frame?: Nullable<GraphFrame>) {
+        const disabledReason = SerializationTools.GetSerializationDisabledReason(globalState);
+        if (disabledReason) {
+            throw new Error(disabledReason);
+        }
+        this.UpdateLocations(flowGraph, globalState, frame);
+
+        // Snapshot live contexts before serialization so we capture the latest
+        // user variables, variable types, and connection values.  This is
+        // important because the graph may be stopped (contexts cleared) when
+        // the user clicks Save.
+        globalState.snapshotUserVariables();
+        const restoreReferenceIds = globalState.prepareReferenceProvenanceForSerialization();
+        try {
+            return this._SerializePrepared(flowGraph, globalState);
+        } finally {
+            restoreReferenceIds();
+        }
+    }
+
+    private static _SerializePrepared(flowGraph: FlowGraph, globalState: GlobalState): string {
+        const coordinator = globalState.coordinator;
+        const graphs = coordinator ? coordinator.flowGraphs : [flowGraph];
+
+        const coordinatorObject: any = {
+            _flowGraphs: [] as any[],
+            activeGraphIndex: globalState.activeGraphIndex,
+            dispatchEventsSynchronously: coordinator?.dispatchEventsSynchronously,
+        };
+        coordinatorObject.referenceProvenance = globalState.referenceProvenance;
+        if (coordinator?.soundAssets.length) {
+            coordinatorObject.soundAssets = coordinator.soundAssets;
+        }
+
+        for (const graph of graphs) {
+            const serializationObject: any = {};
+            graph.serialize(serializationObject);
+
+            // Inject saved context snapshots when the graph is stopped
+            if (graph === flowGraph) {
+                // Active graph — use the current snapshots
+                SerializationTools.InjectSavedContexts(serializationObject, globalState);
+            } else {
+                // Inactive graph — use per-graph saved snapshots
+                const graphSnapshots = globalState.getContextSnapshotsForGraph(graph.uniqueId);
+                if ((!serializationObject.executionContexts || serializationObject.executionContexts.length === 0) && graphSnapshots && graphSnapshots.length > 0) {
+                    serializationObject.executionContexts = graphSnapshots;
+                }
+            }
+
+            // Include editor layout data (block positions, frames, zoom)
+            serializationObject.editorData = (graph as any)._editorData;
+
+            coordinatorObject._flowGraphs.push(serializationObject);
+        }
+
+        // Persist the scene snippet ID so loading the graph can also restore the scene context
+        if (globalState.snippetId) {
+            coordinatorObject.sceneSnippetId = globalState.snippetId;
+        }
+
+        // Persist the flow graph snippet ID so it survives round-trips
+        if (globalState.flowGraphSnippetId) {
+            coordinatorObject.flowGraphSnippetId = globalState.flowGraphSnippetId;
+        }
+
+        return JSON.stringify(coordinatorObject, undefined, 2);
+    }
+
+    /**
+     * Deserialize flow graphs from a serialization object.
+     * Supports both coordinator-level format (`{ _flowGraphs: [...] }`) and
+     * legacy single-graph format (`{ allBlocks: [...], executionContexts: [...] }`).
+     * @param serializationObject - the serialized data to load
+     * @param globalState - the editor's global state
+     * @param scene - optional scene to use instead of globalState.scene
+     * @param pathConverter - optional path converter for JSON pointer blocks
+     * @param options - optional host runtime settings
+     */
+    public static async DeserializeAsync(
+        serializationObject: any,
+        globalState: GlobalState,
+        scene?: Scene,
+        pathConverter?: any,
+        options?: IFlowGraphEditorDeserializeOptions
+    ): Promise<void> {
+        globalState.onIsLoadingChanged.notifyObservers(true);
+        try {
+            const targetScene = scene ?? globalState.scene;
+            const state = await SerializationTools.DeserializeToStateAsync(serializationObject, targetScene, pathConverter, options);
+            SerializationTools.ApplyDeserializedState(state, globalState);
+        } finally {
+            globalState.onIsLoadingChanged.notifyObservers(false);
+        }
+    }
+
+    /**
+     * Parses serialized graphs into an uninstalled coordinator state.
+     * @param serializationObject serialized coordinator or legacy single graph
+     * @param scene scene the parsed coordinator will target
+     * @param pathConverter optional path converter for JSON pointer blocks
+     * @param options optional host runtime settings
+     * @returns parsed state owned by the caller until installed
+     */
+    public static async DeserializeToStateAsync(
+        serializationObject: any,
+        scene: Scene,
+        pathConverter?: any,
+        options?: IFlowGraphEditorDeserializeOptions
+    ): Promise<IFlowGraphEditorDeserializedState> {
+        let graphDataList: ISerializedFlowGraph[];
+        let activeGraphIndex = 0;
+        let sceneSnippetId: string | undefined;
+        let flowGraphSnippetId: string | undefined;
+        const referenceProvenance = (serializationObject.referenceProvenance ?? []) as IFlowGraphEditorDeserializedState["referenceProvenance"];
+
+        if (serializationObject._flowGraphs && Array.isArray(serializationObject._flowGraphs)) {
+            graphDataList = serializationObject._flowGraphs;
+            activeGraphIndex = serializationObject.activeGraphIndex ?? 0;
+            sceneSnippetId = serializationObject.sceneSnippetId;
+            flowGraphSnippetId = serializationObject.flowGraphSnippetId;
+        } else {
+            graphDataList = [serializationObject as ISerializedFlowGraph];
+            sceneSnippetId = serializationObject.sceneSnippetId;
+            flowGraphSnippetId = serializationObject.flowGraphSnippetId;
+        }
+
+        if (graphDataList.length === 0) {
+            throw new Error("A Flow Graph coordinator must contain at least one graph.");
+        }
+        if (options?.sourceFormat !== "KHR_interactivity" && SerializationTools._ContainsKhrInteractivityGraph(graphDataList)) {
+            throw new Error(SerializationTools._KhrPersistenceDisabledReason);
+        }
+
+        const coordinator = new FlowGraphCoordinator({ scene, ...options?.coordinatorConfig });
+        coordinator.dispatchEventsSynchronously =
+            options?.dispatchEventsSynchronously ?? serializationObject.dispatchEventsSynchronously ?? coordinator.dispatchEventsSynchronously;
+        const parsedGraphs: FlowGraph[] = [];
+        const referenceOccurrences: Array<[object, SceneReferenceLocation]> = [];
+        const soundAssetLoadErrors: string[] = [];
+        try {
+            if (Array.isArray(serializationObject.soundAssets)) {
+                const results = await Promise.allSettled(serializationObject.soundAssets.map(async (asset: IFlowGraphSoundAsset) => await coordinator.addSoundAssetAsync(asset)));
+                results.forEach((result, index) => {
+                    if (result.status === "rejected") {
+                        const asset = serializationObject.soundAssets[index] as IFlowGraphSoundAsset;
+                        const reason = result.reason instanceof Error ? result.reason.message : String(result.reason);
+                        soundAssetLoadErrors.push(`Could not load sound asset "${asset.name}": ${reason}`);
+                    }
+                });
+            }
+            for (const graphData of graphDataList) {
+                // eslint-disable-next-line no-await-in-loop -- sequential order is intentional
+                const parsedGraph = await ParseFlowGraphAsync(graphData, { coordinator, pathConverter });
+                referenceOccurrences.push(...SerializationTools.RestoreReferenceProvenance(parsedGraph, graphData, scene, referenceProvenance));
+                SerializationTools.PreserveUnresolvedNames(parsedGraph, graphData);
+                SerializationTools.PreserveUnresolvedVariables(parsedGraph, graphData);
+                SerializationTools.SyncConnectionValuesToDefaults(parsedGraph);
+                if (options?.sourceFormat === "KHR_interactivity") {
+                    _CaptureKhrInteractivityRuntimeInputDefaults(parsedGraph);
+                }
+                if ((graphData as any).editorData) {
+                    (parsedGraph as any)._editorData = (graphData as any).editorData;
+                }
+                parsedGraphs.push(parsedGraph);
+            }
+        } catch (error) {
+            coordinator.dispose();
+            throw error;
+        }
+
+        if (activeGraphIndex < 0 || activeGraphIndex >= parsedGraphs.length) {
+            activeGraphIndex = 0;
+        }
+        return {
+            coordinator,
+            activeGraphIndex,
+            serializationDisabledReason: options?.sourceFormat === "KHR_interactivity" ? SerializationTools._KhrPersistenceDisabledReason : null,
+            hasImportScopedRuntime: options?.sourceFormat === "KHR_interactivity",
+            sceneSnippetId,
+            flowGraphSnippetId,
+            soundAssetLoadErrors,
+            referenceProvenance,
+            referenceOccurrences,
+        };
+    }
+
+    /**
+     * Installs a previously parsed coordinator state and disposes the old coordinator.
+     * @param state parsed state to install
+     * @param globalState editor state to update
+     */
+    public static ApplyDeserializedState(state: IFlowGraphEditorDeserializedState, globalState: GlobalState): void {
+        const previousCoordinator = globalState.coordinator;
+        const disposePreviousCoordinator = globalState.isCoordinatorEditorOwned(previousCoordinator);
+        globalState.serializationDisabledReason = state.serializationDisabledReason;
+        globalState.hasImportScopedRuntime = state.hasImportScopedRuntime;
+        globalState.khrInteractivityImportResult = null;
+        globalState.setCoordinator(state.coordinator, true, false);
+        globalState.restoreReferenceProvenance(state.referenceProvenance, state.referenceOccurrences);
+        globalState.activeGraphIndex = state.activeGraphIndex;
+        if (previousCoordinator && previousCoordinator !== state.coordinator && disposePreviousCoordinator) {
+            previousCoordinator.dispose();
+        }
+
+        const snippetId = state.sceneSnippetId ?? "";
+        if (snippetId && snippetId !== globalState.snippetId) {
+            globalState.snippetId = snippetId;
+            globalState.onSnippetIdChanged.notifyObservers(snippetId);
+        }
+        if (state.flowGraphSnippetId) {
+            globalState.flowGraphSnippetId = state.flowGraphSnippetId;
+        }
+        if (state.soundAssetLoadErrors.length > 0) {
+            globalState.stateManager.onErrorMessageDialogRequiredObservable.notifyObservers(state.soundAssetLoadErrors.join("\n"));
+        }
+    }
+
+    private static _ContainsKhrInteractivityGraph(graphDataList: ISerializedFlowGraph[]): boolean {
+        return graphDataList.some(
+            (graph) =>
+                !!graph.metadata?.khrInteractivity || graph.allBlocks?.some((block) => block.className.startsWith("KHR_interactivity/") || !!block.metadata?.khrInteractivity)
+        );
+    }
+
+    public static RestoreReferenceProvenance(
+        graph: FlowGraph,
+        graphData: ISerializedFlowGraph,
+        scene: Scene,
+        entries: IFlowGraphEditorDeserializedState["referenceProvenance"]
+    ): Array<[object, SceneReferenceLocation]> {
+        const occurrences: Array<[object, SceneReferenceLocation]> = [];
+        const locations = new Map<number, IFlowGraphEditorDeserializedState["referenceProvenance"][number][1][]>();
+        for (const [uniqueId, location] of entries) {
+            const matchingLocations = locations.get(uniqueId) ?? [];
+            matchingLocations.push(location);
+            locations.set(uniqueId, matchingLocations);
+        }
+        const resolve = (value: any, currentValue: any): any => {
+            if (Array.isArray(value)) {
+                return value.map((entry, index) => resolve(entry, Array.isArray(currentValue) ? currentValue[index] : undefined));
+            }
+            if (!value || typeof value !== "object" || typeof value.uniqueId !== "number" || typeof value.className !== "string") {
+                return currentValue;
+            }
+            const matchingLocations = locations.get(value.uniqueId);
+            const location =
+                matchingLocations?.find((candidate) => candidate.className === value.className && candidate.id === value.id && candidate.name === value.name) ??
+                matchingLocations?.find((candidate) => candidate.className === value.className && candidate.id === value.id) ??
+                matchingLocations?.find((candidate) => candidate.className === value.className && candidate.name === value.name) ??
+                (matchingLocations?.length === 1 ? matchingLocations[0] : undefined);
+            if (!location) {
+                return currentValue;
+            }
+            const nodes = scene.getNodes().filter((node) => node.getClassName() === location.className);
+            let candidates = nodes.filter((node) => node.id === location.id);
+            let index = location.idIndex;
+            if (candidates.length === 0) {
+                candidates = nodes.filter((node) => node.name === location.name);
+                index = location.nameIndex;
+            }
+            let resolved;
+            if (location.sceneUid === scene.uid) {
+                resolved = candidates.find((node) => node.uniqueId === value.uniqueId);
+            }
+            if (
+                !resolved &&
+                location.sceneUid === scene.uid &&
+                currentValue &&
+                typeof currentValue.getScene === "function" &&
+                currentValue.getScene() === scene &&
+                currentValue.uniqueId === value.uniqueId &&
+                currentValue.getClassName() === location.className &&
+                currentValue.id === location.id &&
+                candidates.includes(currentValue)
+            ) {
+                resolved = currentValue;
+            }
+            resolved ??= candidates[index];
+            const result = resolved ?? value;
+            occurrences.push([result, location]);
+            return result;
+        };
+        for (const serializedBlock of graphData.allBlocks ?? []) {
+            const block = graph.getAllBlocks().find((candidate) => candidate.uniqueId === serializedBlock.uniqueId);
+            if (!block) {
+                continue;
+            }
+            for (const serializedInput of serializedBlock.dataInputs ?? []) {
+                const input = block.getDataInput(serializedInput.name);
+                if (input && serializedInput.defaultValue !== undefined) {
+                    (input as any)._defaultValue = resolve(serializedInput.defaultValue, (input as any)._defaultValue);
+                }
+            }
+        }
+        for (let index = 0; index < graph.contextCount; index++) {
+            const context = graph.getContext(index);
+            const serializedContext = graphData.executionContexts?.[index] as any;
+            for (const key in serializedContext?._connectionValues ?? {}) {
+                context?._setConnectionValueByKey(key, resolve(serializedContext._connectionValues[key], (context as any)?._connectionValues?.[key]));
+            }
+        }
+        return occurrences;
+    }
+
+    /**
+     * Fetches a flow graph snippet from the Babylon snippet server and loads it
+     * into the editor. Supports plain ids ("ABC123"), versioned ids
+     * ("ABC123#4") and ids with a leading '#'. After a successful load the
+     * snippet id is stored on `globalState.flowGraphSnippetId`, so the next save
+     * publishes a new version of that same snippet.
+     * @param id - the flow graph snippet id to load
+     * @param globalState - the editor's global state
+     * @returns the normalized snippet id that was loaded, or `null` if the load failed
+     */
+    public static async LoadFromSnippetServerAsync(id: string, globalState: GlobalState): Promise<Nullable<string>> {
+        const cleanId = id.replace(/^#/, "");
+
+        let snippet: ISnippetServerResponse;
+        try {
+            // Reuse the shared snippet-loader for the fetch + id/url normalization
+            // instead of hand-rolling the request here.
+            snippet = await FetchSnippet(cleanId, Constants.SnippetUrl);
+        } catch {
+            // FetchSnippet throws on a non-OK response; preserve the historical
+            // null ("could not be loaded") contract expected by the caller.
+            return null;
+        }
+
+        const jsonPayload = JSON.parse(snippet.jsonPayload ?? "{}");
+        // The Flow Graph Editor saves `flowGraph` as a stringified graph, but
+        // older/other producers may store it as a plain object — handle both.
+        const serializationObject = typeof jsonPayload.flowGraph === "string" ? JSON.parse(jsonPayload.flowGraph) : jsonPayload.flowGraph;
+
+        await SerializationTools.DeserializeAsync(serializationObject, globalState);
+        globalState.flowGraphSnippetId = cleanId;
+        return cleanId;
+    }
+
+    /**
+     * After parsing a flow graph from serialized data, unconnected data inputs
+     * have their actual values stored in the execution context's
+     * `_connectionValues` map (keyed by socket uniqueId), while the connection
+     * object's `_defaultValue` stays at the type default (0 for numbers).
+     * The editor UI reads `_defaultValue` for display, so this method copies
+     * the context values into `_defaultValue` for all unconnected inputs.
+     * @param parsedGraph - the parsed flow graph whose inputs need syncing
+     */
+    public static SyncConnectionValuesToDefaults(parsedGraph: FlowGraph): void {
+        const ctx = parsedGraph.getContext(0);
+        if (!ctx) {
+            return;
+        }
+        const connectionValues: Record<string, any> = (ctx as any)._connectionValues;
+        if (!connectionValues) {
+            return;
+        }
+        for (const block of parsedGraph.getAllBlocks()) {
+            for (const input of block.dataInputs) {
+                if (!input.isConnected()) {
+                    const ctxValue = connectionValues[input.uniqueId];
+                    if (ctxValue !== undefined && ctxValue !== null) {
+                        (input as any)._defaultValue = ctxValue;
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * After parsing a flow graph, some config values (AnimationGroup, Animation,
+     * Mesh references) may be undefined because parsing ran against a scene that
+     * doesn't contain the referenced objects.  This method walks the serialized
+     * block configs and stashes the *name* from the serialization object on
+     * the parsed block's config so that the editor's rebind logic can resolve
+     * them later when the correct scene is loaded.
+     * @param parsedGraph - the parsed flow graph
+     * @param serializationObject - the original serialization data
+     */
+    public static PreserveUnresolvedNames(parsedGraph: FlowGraph, serializationObject: any): void {
+        const serializedBlocks: any[] = serializationObject.allBlocks;
+        if (!serializedBlocks) {
+            return;
+        }
+
+        const allBlocks = parsedGraph.getAllBlocks();
+
+        // Map of config keys → the private name key stashed on block.config
+        const nameKeys: Record<string, string> = {
+            animationGroup: "_animationGroupName",
+            animation: "_animationName",
+            targetMesh: "_meshName",
+        };
+
+        for (let i = 0; i < serializedBlocks.length && i < allBlocks.length; i++) {
+            const serialized = serializedBlocks[i];
+            const block = allBlocks[i];
+            if (!serialized.config || !block.config) {
+                continue;
+            }
+            for (const key of Object.keys(nameKeys)) {
+                const nameKey = nameKeys[key];
+                const serializedValue = serialized.config[key];
+                const parsedValue = (block.config as any)[key];
+                // The serialized value had a {name, className} descriptor but
+                // parsing failed to resolve it (parsedValue is undefined/null).
+                if (serializedValue && typeof serializedValue === "object" && serializedValue.name && !parsedValue) {
+                    (block.config as any)[nameKey] = serializedValue.name;
+                }
+            }
+        }
+    }
+
+    /**
+     * Patch unresolved user-variable descriptors back onto parsed contexts.
+     * When parsing runs against the editor's host scene (which typically has
+     * no user meshes), Mesh/Light/Camera variable references resolve to
+     * `undefined`.  This method restores the original `{id, name, className}`
+     * descriptor from the serialized JSON so that `_rebindContextUserVariables`
+     * can resolve them later when the preview scene loads.
+     * @param parsedGraph - the parsed flow graph with potentially unresolved variables
+     * @param serializationObject - the original JSON with the full descriptors
+     */
+    public static PreserveUnresolvedVariables(parsedGraph: FlowGraph, serializationObject: any): void {
+        const serializedContexts: any[] = serializationObject.executionContexts;
+        if (!serializedContexts) {
+            return;
+        }
+        for (let i = 0; i < serializedContexts.length; i++) {
+            const serializedCtx = serializedContexts[i];
+            const parsedCtx = parsedGraph.getContext(i);
+            if (!parsedCtx || !serializedCtx?._userVariables) {
+                continue;
+            }
+            for (const key in serializedCtx._userVariables) {
+                const desc = serializedCtx._userVariables[key];
+                // Only patch back object descriptors (className present) when the
+                // parsed value is falsy (undefined/null — i.e. not resolved).
+                if (desc && typeof desc === "object" && desc.className && !parsedCtx.userVariables[key]) {
+                    parsedCtx.setVariable(key, desc);
+                }
+            }
+        }
+    }
+
+    /**
+     * The custom extension name used to embed flow graph data in a glTF file.
+     */
+    public static readonly GLTF_EXTENSION_NAME = "BABYLON_flow_graph";
+
+    // GLB format constants
+    private static readonly _GLB_MAGIC = 0x46546c67; // "glTF" in little-endian
+    private static readonly _GLB_MAGIC_BYTES = [0x67, 0x6c, 0x54, 0x46]; // "glTF" byte sequence
+    private static readonly _GLB_VERSION = 2;
+    private static readonly _GLB_HEADER_SIZE = 12;
+    private static readonly _GLB_CHUNK_HEADER_SIZE = 8;
+    private static readonly _GLB_JSON_CHUNK_TYPE = 0x4e4f534a; // "JSON" in little-endian
+    private static readonly _GLB_SPACE_PAD = 0x20;
+
+    /**
+     * Export the flow graph (and optionally the preview scene) as a .glb file.
+     * The flow graph JSON is embedded inside a custom glTF extension called
+     * `BABYLON_flow_graph` so it can be re-imported by this editor.
+     * @param flowGraph - the flow graph to export
+     * @param globalState - the editor's global state
+     * @param scene - optional preview scene to include in the export
+     */
+    public static async ExportBabylonFlowGraphGlbAsync(flowGraph: FlowGraph, globalState: GlobalState, scene: Nullable<Scene>): Promise<void> {
+        const disabledReason = SerializationTools.GetSerializationDisabledReason(globalState);
+        if (disabledReason) {
+            throw new Error(disabledReason);
+        }
+        this.UpdateLocations(flowGraph, globalState);
+        globalState.snapshotUserVariables();
+        const restoreReferenceIds = globalState.prepareReferenceProvenanceForSerialization();
+        let fgSerialized: any;
+        try {
+            // Serialize the flow graph to JSON
+            fgSerialized = {};
+            flowGraph.serialize(fgSerialized);
+            // Inject saved context snapshots when the graph has no live contexts
+            SerializationTools.InjectSavedContexts(fgSerialized, globalState);
+            fgSerialized.editorData = (flowGraph as any)._editorData;
+            if (globalState.snippetId) {
+                fgSerialized.sceneSnippetId = globalState.snippetId;
+            }
+            if (globalState.flowGraphSnippetId) {
+                fgSerialized.flowGraphSnippetId = globalState.flowGraphSnippetId;
+            }
+            if (globalState.coordinator?.soundAssets.length) {
+                fgSerialized.soundAssets = globalState.coordinator.soundAssets;
+            }
+            fgSerialized.referenceProvenance = globalState.referenceProvenance;
+            fgSerialized = JSON.parse(JSON.stringify(fgSerialized));
+        } finally {
+            restoreReferenceIds();
+        }
+
+        // Build the glTF JSON with the flow graph embedded as an extension
+        const gltfJson: any = {
+            asset: { version: "2.0", generator: "Babylon.js Flow Graph Editor" },
+            scene: 0,
+            scenes: [{ name: "Scene" }],
+            extensionsUsed: [SerializationTools.GLTF_EXTENSION_NAME],
+            extensions: {
+                [SerializationTools.GLTF_EXTENSION_NAME]: {
+                    flowGraph: fgSerialized,
+                },
+            },
+        };
+
+        // If we have a preview scene, try to use GLTF2Export for a full scene export
+        if (scene) {
+            try {
+                // The serializers bundle is loaded by the CDN serve and attaches
+                // GLTF2Export to the global BABYLON namespace, so we access it
+                // from the global directly.
+                // eslint-disable-next-line @typescript-eslint/naming-convention
+                const GLTF2Export = (globalThis as any).BABYLON?.GLTF2Export;
+                if (!GLTF2Export) {
+                    throw new Error("GLTF2Export not available on BABYLON global");
+                }
+                const glbData = await GLTF2Export.GLBAsync(scene, "flowGraph", {});
+
+                // Extract the GLB and inject our custom extension into its JSON chunk
+                const glbFile = glbData.files["flowGraph.glb"];
+                if (glbFile instanceof Blob) {
+                    const buffer = await glbFile.arrayBuffer();
+                    const augmented = SerializationTools._InjectExtensionIntoGlb(new Uint8Array(buffer), fgSerialized);
+                    if (augmented) {
+                        SerializationTools._DownloadBlob(new Blob([augmented.buffer as ArrayBuffer], { type: "model/gltf-binary" }), "flowGraph.glb", globalState);
+                        return;
+                    } else {
+                        Logger.Warn("Failed to inject flow graph extension into scene GLB; falling back to minimal export without scene geometry.");
+                    }
+                }
+            } catch (e) {
+                // GLTF2Export not available — fall back to building a minimal glb
+                Logger.Warn("Full scene GLB export failed, falling back to minimal export: " + (e instanceof Error ? e.message : String(e)));
+            }
+        }
+
+        // Build a minimal GLB (no scene geometry, just the extension)
+        const jsonStr = JSON.stringify(gltfJson);
+        const glb = SerializationTools._BuildMinimalGlb(jsonStr);
+        SerializationTools._DownloadBlob(new Blob([glb.buffer as ArrayBuffer], { type: "model/gltf-binary" }), "flowGraph.glb", globalState);
+    }
+
+    /**
+     * Backward-compatible alias for exporting the BABYLON_flow_graph GLB format.
+     * @param flowGraph graph to export
+     * @param globalState editor state
+     * @param scene optional preview scene
+     */
+    public static async ExportGlbAsync(flowGraph: FlowGraph, globalState: GlobalState, scene: Nullable<Scene>): Promise<void> {
+        await SerializationTools.ExportBabylonFlowGraphGlbAsync(flowGraph, globalState, scene);
+    }
+
+    /**
+     * Analyzes whether the active coordinator can be exported as KHR_interactivity.
+     * Retained assets preserve imported compatibility data instead of requiring a ratified scene re-export.
+     * @param globalState editor state containing canonical import provenance
+     * @returns detached representability analysis
+     */
+    public static AnalyzeKhrInteractivityExport(globalState: GlobalState): IKHRInteractivityExportAnalysis {
+        if (globalState.khrInteractivityImportResult?.scene && globalState.sceneContext?.scene !== globalState.khrInteractivityImportResult.scene) {
+            return {
+                representable: false,
+                nodes: [],
+                diagnostics: [
+                    {
+                        code: "GRAPH_SOURCE_MISSING",
+                        path: "/extensions/KHR_interactivity",
+                        message: "The active preview scene is not the scene that owns this KHR_interactivity graph set.",
+                        severity: "error",
+                    },
+                ],
+            };
+        }
+        const plan = _CreateKhrExportPlanForImport(globalState);
+        if (!plan) {
+            return {
+                representable: false,
+                nodes: [],
+                diagnostics: [
+                    {
+                        code: "GRAPH_SOURCE_MISSING",
+                        path: "/extensions/KHR_interactivity",
+                        message: "KHR_interactivity export requires a graph imported from a canonical KHR_interactivity glTF or GLB.",
+                        severity: "error",
+                    },
+                ],
+            };
+        }
+        return plan.analyze();
+    }
+
+    /**
+     * Exports the active graph set, patching retained imported assets without reserializing their scenes.
+     * Graphs without a retained asset use the Babylon glTF serializer.
+     * The live editor graphs are analyzed and read without mutation.
+     * @param globalState editor state
+     * @param format glTF JSON or binary GLB
+     * @returns detached representability analysis for the exported graph set
+     */
+    public static async ExportKhrInteractivityAsync(globalState: GlobalState, format: "gltf" | "glb"): Promise<IKHRInteractivityExportAnalysis> {
+        const scene = globalState.sceneContext?.scene;
+        const plan = _CreateKhrExportPlanForImport(globalState);
+        if (!plan || !scene) {
+            const analysis = SerializationTools.AnalyzeKhrInteractivityExport(globalState);
+            throw _CreateKhrExportError(analysis.diagnostics);
+        }
+        const analysis = plan.analyze();
+        if (!analysis.representable) {
+            throw _CreateKhrExportError(analysis.diagnostics);
+        }
+        const sourceFile = globalState.sourceGlb?.file ?? globalState.sourceGltf?.file;
+        if (sourceFile) {
+            const sourceFormat = globalState.sourceGlb ? "glb" : "gltf";
+            const extension = plan.buildWithSourceIndices();
+            const required = [...(plan.required ? ["KHR_interactivity"] : []), ...plan.additionalExtensionsRequired];
+            const bytes = ExportKhrInteractivityAsset(new Uint8Array(await sourceFile.arrayBuffer()), sourceFormat, format, extension, plan.additionalExtensionsUsed, required);
+            const fileName = sourceFile.name.replace(/\.(glb|gltf)$/i, `-edited.${format}`);
+            SerializationTools._DownloadBlob(new Blob([new Uint8Array(bytes)], { type: format === "glb" ? "model/gltf-binary" : "model/gltf+json" }), fileName, globalState);
+            return analysis;
+        }
+        const serializer = (globalThis as any).BABYLON?.GLTF2Export;
+        if (!serializer) {
+            throw new Error("GLTF2Export is not available.");
+        }
+        const data =
+            format === "glb"
+                ? await serializer.GLBAsync(scene, "flowGraphKHRInteractivity", { khrInteractivity: plan })
+                : await serializer.GLTFAsync(scene, "flowGraphKHRInteractivity", { khrInteractivity: plan });
+        data.downloadFiles();
+        return analysis;
+    }
+
+    /**
+     * Reads a serialized flow graph from a .glb/.gltf file's BABYLON_flow_graph extension.
+     * @param file - the file dropped by the user
+     * @returns the serialized graph, or null when the extension is absent
+     * @throws when the extension is present but does not contain a serialized graph object
+     */
+    public static async ReadFlowGraphFromGlbAsync(file: File): Promise<any | null> {
+        const buffer = await file.arrayBuffer();
+        const bytes = new Uint8Array(buffer);
+
+        let gltfJson: any;
+
+        // Check if it's a GLB (binary glTF)
+        if (
+            bytes.length >= SerializationTools._GLB_HEADER_SIZE + SerializationTools._GLB_CHUNK_HEADER_SIZE &&
+            bytes[0] === SerializationTools._GLB_MAGIC_BYTES[0] &&
+            bytes[1] === SerializationTools._GLB_MAGIC_BYTES[1] &&
+            bytes[2] === SerializationTools._GLB_MAGIC_BYTES[2] &&
+            bytes[3] === SerializationTools._GLB_MAGIC_BYTES[3]
+        ) {
+            // GLB format: header (12 bytes) + JSON chunk (8-byte header + data)
+            const chunkHeaderView = new DataView(buffer, SerializationTools._GLB_HEADER_SIZE, SerializationTools._GLB_CHUNK_HEADER_SIZE);
+            const jsonChunkLength = chunkHeaderView.getUint32(0, true);
+            const jsonChunkType = chunkHeaderView.getUint32(4, true);
+            const jsonDataOffset = SerializationTools._GLB_HEADER_SIZE + SerializationTools._GLB_CHUNK_HEADER_SIZE;
+
+            // Validate: first chunk must be JSON and data must fit within buffer
+            if (jsonChunkType !== SerializationTools._GLB_JSON_CHUNK_TYPE || jsonDataOffset + jsonChunkLength > buffer.byteLength) {
+                return null;
+            }
+            const jsonChunkData = new Uint8Array(buffer, jsonDataOffset, jsonChunkLength);
+            const decoder = new TextDecoder("utf-8");
+            try {
+                gltfJson = JSON.parse(decoder.decode(jsonChunkData));
+            } catch {
+                return null;
+            }
+        } else {
+            // Plain .gltf JSON
+            const decoder = new TextDecoder("utf-8");
+            try {
+                gltfJson = JSON.parse(decoder.decode(bytes));
+            } catch {
+                return null;
+            }
+        }
+
+        // Check for our custom extension
+        const ext = gltfJson?.extensions?.[SerializationTools.GLTF_EXTENSION_NAME];
+        if (!ext) {
+            return null;
+        }
+        if (!Object.prototype.hasOwnProperty.call(ext, "flowGraph") || !ext.flowGraph || typeof ext.flowGraph !== "object") {
+            throw new Error("Malformed BABYLON_flow_graph extension: flowGraph must be a serialized graph object.");
+        }
+        return ext.flowGraph;
+    }
+
+    /**
+     * Try to import a flow graph from a .glb/.gltf file's BABYLON_flow_graph extension.
+     * @param file - the file dropped by the user
+     * @param globalState - the editor's global state
+     * @returns true if a flow graph was found and imported, false otherwise
+     */
+    public static async ImportFromGlbAsync(file: File, globalState: GlobalState): Promise<boolean> {
+        const serializedGraph = await SerializationTools.ReadFlowGraphFromGlbAsync(file);
+        if (!serializedGraph) {
+            return false;
+        }
+        await SerializationTools.DeserializeAsync(serializedGraph, globalState);
+        globalState.stateManager.onSelectionChangedObservable.notifyObservers(null);
+        globalState.onClearUndoStack.notifyObservers();
+        return true;
+    }
+
+    /**
+     * Inject the BABYLON_flow_graph extension into an existing GLB's JSON chunk.
+     * @param glbBytes - original GLB bytes
+     * @param fgSerialized - the serialized flow graph data
+     * @returns the augmented GLB bytes, or null if parsing fails
+     */
+    private static _InjectExtensionIntoGlb(glbBytes: Uint8Array, fgSerialized: any): Nullable<Uint8Array> {
+        const minSize = SerializationTools._GLB_HEADER_SIZE + SerializationTools._GLB_CHUNK_HEADER_SIZE;
+        if (glbBytes.length < minSize) {
+            return null;
+        }
+
+        const view = new DataView(glbBytes.buffer, glbBytes.byteOffset, glbBytes.byteLength);
+
+        // Read JSON chunk length from GLB
+        const jsonChunkLength = view.getUint32(SerializationTools._GLB_HEADER_SIZE, true);
+        const jsonDataOffset = SerializationTools._GLB_HEADER_SIZE + SerializationTools._GLB_CHUNK_HEADER_SIZE;
+        const jsonChunkData = glbBytes.slice(jsonDataOffset, jsonDataOffset + jsonChunkLength);
+        const decoder = new TextDecoder("utf-8");
+
+        let gltfJson: any;
+        try {
+            gltfJson = JSON.parse(decoder.decode(jsonChunkData));
+        } catch {
+            return null;
+        }
+
+        // Inject extension
+        gltfJson.extensionsUsed = gltfJson.extensionsUsed || [];
+        if (!gltfJson.extensionsUsed.includes(SerializationTools.GLTF_EXTENSION_NAME)) {
+            gltfJson.extensionsUsed.push(SerializationTools.GLTF_EXTENSION_NAME);
+        }
+        gltfJson.extensions = gltfJson.extensions || {};
+        gltfJson.extensions[SerializationTools.GLTF_EXTENSION_NAME] = { flowGraph: fgSerialized };
+
+        // Rebuild GLB
+        const encoder = new TextEncoder();
+        let newJsonBytes = encoder.encode(JSON.stringify(gltfJson));
+        // Pad to 4-byte boundary with spaces
+        while (newJsonBytes.length % 4 !== 0) {
+            const padded = new Uint8Array(newJsonBytes.length + 1);
+            padded.set(newJsonBytes);
+            padded[padded.length - 1] = SerializationTools._GLB_SPACE_PAD;
+            newJsonBytes = padded;
+        }
+
+        // Binary chunk (everything after the original JSON chunk)
+        const binaryStart = jsonDataOffset + jsonChunkLength;
+        const binaryChunk = glbBytes.slice(binaryStart);
+
+        // Build new GLB
+        const totalLength = SerializationTools._GLB_HEADER_SIZE + SerializationTools._GLB_CHUNK_HEADER_SIZE + newJsonBytes.length + binaryChunk.length;
+        const result = new Uint8Array(totalLength);
+        const resultView = new DataView(result.buffer);
+
+        // GLB header
+        resultView.setUint32(0, SerializationTools._GLB_MAGIC, true);
+        resultView.setUint32(4, SerializationTools._GLB_VERSION, true);
+        resultView.setUint32(8, totalLength, true);
+
+        // JSON chunk header
+        resultView.setUint32(SerializationTools._GLB_HEADER_SIZE, newJsonBytes.length, true);
+        resultView.setUint32(SerializationTools._GLB_HEADER_SIZE + 4, SerializationTools._GLB_JSON_CHUNK_TYPE, true);
+        result.set(newJsonBytes, jsonDataOffset);
+
+        // Binary chunk (if any)
+        if (binaryChunk.length > 0) {
+            result.set(binaryChunk, jsonDataOffset + newJsonBytes.length);
+        }
+
+        return result;
+    }
+
+    /**
+     * Build a minimal GLB from a JSON string (no binary chunk).
+     * @param jsonStr - the stringified glTF JSON
+     * @returns a Uint8Array containing the complete GLB
+     */
+    private static _BuildMinimalGlb(jsonStr: string): Uint8Array {
+        const encoder = new TextEncoder();
+        let jsonBytes = encoder.encode(jsonStr);
+        // Pad to 4-byte boundary with spaces
+        while (jsonBytes.length % 4 !== 0) {
+            const padded = new Uint8Array(jsonBytes.length + 1);
+            padded.set(jsonBytes);
+            padded[padded.length - 1] = SerializationTools._GLB_SPACE_PAD;
+            jsonBytes = padded;
+        }
+
+        const totalLength = SerializationTools._GLB_HEADER_SIZE + SerializationTools._GLB_CHUNK_HEADER_SIZE + jsonBytes.length;
+        const glb = new Uint8Array(totalLength);
+        const view = new DataView(glb.buffer);
+
+        // Header
+        view.setUint32(0, SerializationTools._GLB_MAGIC, true);
+        view.setUint32(4, SerializationTools._GLB_VERSION, true);
+        view.setUint32(8, totalLength, true);
+
+        // JSON chunk
+        const jsonDataOffset = SerializationTools._GLB_HEADER_SIZE + SerializationTools._GLB_CHUNK_HEADER_SIZE;
+        view.setUint32(SerializationTools._GLB_HEADER_SIZE, jsonBytes.length, true);
+        view.setUint32(SerializationTools._GLB_HEADER_SIZE + 4, SerializationTools._GLB_JSON_CHUNK_TYPE, true);
+        glb.set(jsonBytes, jsonDataOffset);
+
+        return glb;
+    }
+
+    /**
+     * Download a blob as a file.
+     * @param blob - the blob to download
+     * @param fileName - the file name
+     * @param globalState - the editor's global state
+     */
+    private static _DownloadBlob(blob: Blob, fileName: string, globalState: GlobalState): void {
+        const url = URL.createObjectURL(blob);
+        const a = globalState.hostDocument.createElement("a");
+        a.href = url;
+        a.download = fileName;
+        a.click();
+        // Cleanup after a short delay
+        setTimeout(() => URL.revokeObjectURL(url), 5000);
+    }
+}

@@ -1,0 +1,925 @@
+import { type Nullable } from "../types";
+import { Matrix } from "../Maths/math.vector.pure";
+import {
+    type _IAnimationState,
+    Animation,
+    _StaticOffsetValueColor3,
+    _StaticOffsetValueColor4,
+    _StaticOffsetValueQuaternion,
+    _StaticOffsetValueSize,
+    _StaticOffsetValueVector2,
+    _StaticOffsetValueVector3,
+} from "./animation.pure";
+import { type AnimationEvent } from "./animationEvent";
+import { type Animatable } from "./animatable";
+import { type Scene } from "../scene";
+import { type IAnimationKey } from "./animationKey";
+
+/**
+ * @internal
+ * A write of a runtime animation to one of its targets in an animation step, recorded as it is made.
+ */
+export interface IRuntimeAnimationWrite {
+    /** The runtime animation that wrote; null once the record is emptied, after its step. */
+    runtimeAnimation: Nullable<RuntimeAnimation>;
+    /** The object it wrote a property of; null once the record is emptied. */
+    target: any;
+    /** The weight it wrote with, -1 for a direct write. */
+    weight: number;
+    /** Whether it wrote additively. */
+    additive: boolean;
+    /** The factor the value it wrote was blended in with, one once the animation has blended in. */
+    blendingFactor: number;
+    /** Whether a step prologue has already held the record over; a direct write is held over one step and no more. */
+    carried: boolean;
+}
+
+/**
+ * Defines a runtime animation
+ */
+export class RuntimeAnimation {
+    private _events = new Array<AnimationEvent>();
+
+    /**
+     * The current frame of the runtime animation
+     */
+    private _currentFrame: number = 0;
+
+    /**
+     * The animation used by the runtime animation
+     */
+    public _animation: Animation;
+
+    /**
+     * The target of the runtime animation
+     */
+    private _target: any;
+
+    /**
+     * The initiating animatable
+     */
+    private _host: Animatable;
+
+    /**
+     * The original value of the runtime animation
+     */
+    private _originalValue = new Array<any>();
+
+    /**
+     * The original blend value of the runtime animation
+     */
+    private _originalBlendValue: Nullable<any> = null;
+
+    /**
+     * The offsets cache of the runtime animation
+     */
+    private _offsetsCache: { [key: string]: any } = {};
+
+    /**
+     * The high limits cache of the runtime animation
+     */
+    private _highLimitsCache: { [key: string]: any } = {};
+
+    /**
+     * Specifies if the runtime animation has been stopped
+     */
+    private _stopped = false;
+
+    /**
+     * The blending factor of the runtime animation
+     */
+    private _blendingFactor = 0;
+
+    /**
+     * The BabylonJS scene
+     */
+    private _scene: Scene;
+
+    /**
+     * The current value of the runtime animation
+     */
+    private _currentValue: Nullable<any> = null;
+
+    /** @internal */
+    public _animationState: _IAnimationState;
+
+    /**
+     * The active target of the runtime animation
+     */
+    private _activeTargets: any[];
+    private _currentActiveTarget: Nullable<any> = null;
+    private _directTarget: Nullable<any> = null;
+
+    /**
+     * The target path of the runtime animation
+     */
+    private _targetPath: string = "";
+
+    /**
+     * The weight of the runtime animation
+     */
+    private _weight = 1.0;
+
+    /**
+     * The absolute frame offset of the runtime animation
+     */
+    private _absoluteFrameOffset = 0;
+
+    /**
+     * The previous elapsed time (since start of animation) of the runtime animation
+     */
+    private _previousElapsedTime: number = 0;
+
+    private _yoyoDirection: number = 1;
+
+    /**
+     * The previous absolute frame of the runtime animation (meaning, without taking into account the from/to values, only the elapsed time and the fps)
+     */
+    private _previousAbsoluteFrame: number = 0;
+    private _playbackFrom = 0;
+    private _playbackTo = 0;
+    private _playbackFrames = 0;
+    private _playbackProgress = 0;
+    private _playbackSyncRoot: Nullable<Animatable> = null;
+    private _playbackJumped = false;
+    private _playbackSyncMasterPlayed = 0;
+    private _playbackSyncMasterFrame = 0;
+
+    private _enableBlending: boolean;
+
+    private _keys: IAnimationKey[];
+    private _minFrame: number;
+    private _maxFrame: number;
+    private _targetIsArray = false;
+
+    /** @internal */
+    public _coreRuntimeAnimation: RuntimeAnimation | null = null;
+
+    /**
+     * Gets the current frame of the runtime animation
+     */
+    public get currentFrame(): number {
+        return this._currentFrame;
+    }
+
+    /**
+     * @internal
+     * The first frame of the range the animation was last evaluated over: the requested range, clamped to its keys.
+     */
+    public get _evaluatedFrom(): number {
+        return this._playbackFrom;
+    }
+
+    /**
+     * @internal
+     * The last frame of the range the animation was last evaluated over.
+     */
+    public get _evaluatedTo(): number {
+        return this._playbackTo;
+    }
+
+    /**
+     * @internal
+     * How far the pose last evaluated had played from _evaluatedFrom, in frames, unwrapped across loops: folding it into
+     * the range gives the frame that was evaluated, and dividing it by the range counts the whole cycles the pose has been
+     * through. It follows a synchronization root, swings with a yoyo loop and holds where a constant loop or a playback
+     * that does not loop holds its pose, so it always describes the pose that was evaluated.
+     */
+    public get _evaluatedProgress(): number {
+        return this._playbackProgress;
+    }
+
+    /**
+     * @internal
+     * The animatable the evaluation was clocked by, captured as it was made: the pose of a step stays that of the root
+     * it was synchronized with then, whatever the host has been synchronized with since.
+     */
+    public get _evaluatedSyncRoot(): Nullable<Animatable> {
+        return this._playbackSyncRoot;
+    }
+
+    /**
+     * @internal
+     * Whether the evaluated progress jumped rather than playing on from the one before: the pose of a follower snapped
+     * back to the start of its range by a root whose own clock cannot carry it to the end.
+     */
+    public get _evaluatedJump(): boolean {
+        return this._playbackJumped;
+    }
+
+    /**
+     * Gets the weight of the runtime animation
+     */
+    public get weight(): number {
+        return this._weight;
+    }
+
+    /**
+     * Gets the current value of the runtime animation
+     */
+    public get currentValue(): any {
+        return this._currentValue;
+    }
+
+    /**
+     * Gets or sets the target path of the runtime animation
+     */
+    public get targetPath(): string {
+        return this._targetPath;
+    }
+
+    /**
+     * Gets the actual target of the runtime animation
+     */
+    public get target(): any {
+        return this._currentActiveTarget;
+    }
+
+    /**
+     * Gets the additive state of the runtime animation
+     */
+    public get isAdditive(): boolean {
+        return this._host && this._host.isAdditive;
+    }
+
+    /** @internal */
+    public _onLoop: () => void;
+
+    /**
+     * Create a new RuntimeAnimation object
+     * @param target defines the target of the animation
+     * @param animation defines the source animation object
+     * @param scene defines the hosting scene
+     * @param host defines the initiating Animatable
+     */
+    public constructor(target: any, animation: Animation, scene: Scene, host: Animatable) {
+        this._animation = animation;
+        this._target = target;
+        this._scene = scene;
+        this._host = host;
+        this._activeTargets = [];
+
+        animation._runtimeAnimations.push(this);
+
+        // State
+        this._animationState = {
+            key: 0,
+            repeatCount: 0,
+            loopMode: this._getCorrectLoopMode(),
+        };
+
+        if (this._animation.dataType === Animation.ANIMATIONTYPE_MATRIX) {
+            this._animationState.workValue = Matrix.Zero();
+        }
+
+        // Limits
+        this._keys = this._animation.getKeys();
+        this._minFrame = this._keys[0].frame;
+        this._maxFrame = this._keys[this._keys.length - 1].frame;
+
+        // Add a start key at frame 0 if missing
+        if (this._minFrame !== 0) {
+            const newKey = { frame: 0, value: this._keys[0].value };
+            this._keys.splice(0, 0, newKey);
+        }
+
+        // Check data
+        if (this._target instanceof Array) {
+            let index = 0;
+            for (const target of this._target) {
+                this._preparePath(target, index);
+                this._getOriginalValues(index);
+                index++;
+            }
+            this._targetIsArray = true;
+        } else {
+            this._preparePath(this._target);
+            this._getOriginalValues();
+            this._targetIsArray = false;
+            this._directTarget = this._activeTargets[0];
+        }
+
+        // Cloning events locally
+        const events = animation.getEvents();
+        if (events && events.length > 0) {
+            for (const e of events) {
+                this._events.push(e._clone());
+            }
+        }
+
+        this._enableBlending = target && target.animationPropertiesOverride ? target.animationPropertiesOverride.enableBlending : this._animation.enableBlending;
+    }
+
+    private _preparePath(target: any, targetIndex = 0) {
+        const targetPropertyPath = this._animation.targetPropertyPath;
+
+        if (targetPropertyPath.length > 1) {
+            let property = target;
+            for (let index = 0; index < targetPropertyPath.length - 1; index++) {
+                const name = targetPropertyPath[index];
+                property = property[name];
+                if (property === undefined) {
+                    throw new Error(`Invalid property (${name}) in property path (${targetPropertyPath.join(".")})`);
+                }
+            }
+
+            this._targetPath = targetPropertyPath[targetPropertyPath.length - 1];
+            this._activeTargets[targetIndex] = property;
+        } else {
+            this._targetPath = targetPropertyPath[0];
+            this._activeTargets[targetIndex] = target;
+        }
+
+        if (this._activeTargets[targetIndex][this._targetPath] === undefined) {
+            throw new Error(`Invalid property (${this._targetPath}) in property path (${targetPropertyPath.join(".")})`);
+        }
+    }
+
+    /**
+     * Gets the animation from the runtime animation
+     */
+    public get animation(): Animation {
+        return this._animation;
+    }
+
+    /**
+     * Resets the runtime animation to the beginning
+     * @param restoreOriginal defines whether to restore the target property to the original value
+     */
+    public reset(restoreOriginal = false): void {
+        if (restoreOriginal) {
+            if (this._target instanceof Array) {
+                let index = 0;
+                for (const target of this._target) {
+                    if (this._originalValue[index] !== undefined) {
+                        this._setValue(target, this._activeTargets[index], this._originalValue[index], -1, index);
+                    }
+                    index++;
+                }
+            } else {
+                if (this._originalValue[0] !== undefined) {
+                    this._setValue(this._target, this._directTarget, this._originalValue[0], -1, 0);
+                }
+            }
+        }
+
+        this._offsetsCache = {};
+        this._highLimitsCache = {};
+        this._currentFrame = 0;
+        this._blendingFactor = 0;
+
+        // Events
+        for (let index = 0; index < this._events.length; index++) {
+            this._events[index].isDone = false;
+        }
+    }
+
+    /**
+     * Specifies if the runtime animation is stopped
+     * @returns Boolean specifying if the runtime animation is stopped
+     */
+    public isStopped(): boolean {
+        return this._stopped;
+    }
+
+    /**
+     * Disposes of the runtime animation
+     */
+    public dispose(): void {
+        const index = this._animation.runtimeAnimations.indexOf(this);
+
+        if (index > -1) {
+            this._animation.runtimeAnimations.splice(index, 1);
+        }
+    }
+
+    /**
+     * Apply the interpolated value to the target
+     * @param currentValue defines the value computed by the animation
+     * @param weight defines the weight to apply to this value (Defaults to 1.0)
+     */
+    public setValue(currentValue: any, weight: number) {
+        if (this._targetIsArray) {
+            for (let index = 0; index < this._target.length; index++) {
+                const target = this._target[index];
+                this._setValue(target, this._activeTargets[index], currentValue, weight, index);
+            }
+            return;
+        }
+        this._setValue(this._target, this._directTarget, currentValue, weight, 0);
+    }
+
+    private _getOriginalValues(targetIndex = 0) {
+        let originalValue: any;
+        const target = this._activeTargets[targetIndex];
+
+        if (Animation.InheritOriginalValueFromActiveAnimations) {
+            // When another active animation is already driving the same target+property,
+            // inherit its _originalValue instead of snapshotting the live (mid-animation) value.
+            // This prevents the "stuck value" bug when overlapping animations interrupt each other.
+            const activeAnimatables = this._scene._activeAnimatables;
+            for (let animIndex = 0; animIndex < activeAnimatables.length; animIndex++) {
+                const runtimeAnimations = activeAnimatables[animIndex]._runtimeAnimations;
+                for (let rtIndex = 0; rtIndex < runtimeAnimations.length; rtIndex++) {
+                    const rtAnim = runtimeAnimations[rtIndex];
+                    if (rtAnim === this) {
+                        continue;
+                    }
+                    if (rtAnim._targetPath === this._targetPath) {
+                        for (let i = 0; i < rtAnim._activeTargets.length; i++) {
+                            if (rtAnim._activeTargets[i] === target && rtAnim._originalValue[i] !== undefined) {
+                                if (rtAnim._originalValue[i] && rtAnim._originalValue[i].clone) {
+                                    this._originalValue[targetIndex] = rtAnim._originalValue[i].clone();
+                                } else {
+                                    this._originalValue[targetIndex] = rtAnim._originalValue[i];
+                                }
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (target.getLocalMatrix && this._targetPath === "_matrix") {
+            // For bones
+            originalValue = target.getLocalMatrix();
+        } else {
+            originalValue = target[this._targetPath];
+        }
+
+        if (originalValue && originalValue.clone) {
+            this._originalValue[targetIndex] = originalValue.clone();
+        } else {
+            this._originalValue[targetIndex] = originalValue;
+        }
+    }
+
+    private _registerTargetForLateAnimationBinding(runtimeAnimation: RuntimeAnimation, originalValue: any): void {
+        const target = runtimeAnimation.target;
+        this._scene._registeredForLateAnimationBindings.pushNoDuplicate(target);
+
+        if (!target._lateAnimationHolders) {
+            target._lateAnimationHolders = {};
+        }
+
+        if (!target._lateAnimationHolders[runtimeAnimation.targetPath]) {
+            target._lateAnimationHolders[runtimeAnimation.targetPath] = {
+                totalWeight: 0,
+                totalAdditiveWeight: 0,
+                animations: [],
+                additiveAnimations: [],
+                originalValue: originalValue,
+            };
+        }
+
+        if (runtimeAnimation.isAdditive) {
+            target._lateAnimationHolders[runtimeAnimation.targetPath].additiveAnimations.push(runtimeAnimation);
+            target._lateAnimationHolders[runtimeAnimation.targetPath].totalAdditiveWeight += runtimeAnimation.weight;
+        } else {
+            target._lateAnimationHolders[runtimeAnimation.targetPath].animations.push(runtimeAnimation);
+            target._lateAnimationHolders[runtimeAnimation.targetPath].totalWeight += runtimeAnimation.weight;
+        }
+    }
+
+    private _setValue(target: any, destination: any, currentValue: any, weight: number, targetIndex: number): void {
+        // Recorded as written - the target, the weight and whether additively, as the bindings take it - so what an
+        // animation step wrote can be read after the step from these records alone, whatever a callback did since.
+        const writes = this._scene._animationWrites;
+        const count = this._scene._animationWriteCount++;
+        let write = writes[count];
+        if (!write) {
+            write = writes[count] = { runtimeAnimation: this, target, weight, additive: false, blendingFactor: 1, carried: false };
+        }
+        write.runtimeAnimation = this;
+        write.target = target;
+        write.weight = weight;
+        write.additive = this.isAdditive;
+        write.carried = false;
+
+        // Set value
+        this._currentActiveTarget = destination;
+
+        this._weight = weight;
+
+        if (this._enableBlending && this._blendingFactor <= 1.0) {
+            if (!this._originalBlendValue) {
+                const originalValue = destination[this._targetPath];
+
+                if (originalValue.clone) {
+                    this._originalBlendValue = originalValue.clone();
+                } else {
+                    this._originalBlendValue = originalValue;
+                }
+            }
+
+            if (this._originalBlendValue.m) {
+                // Matrix
+                if (Animation.AllowMatrixDecomposeForInterpolation) {
+                    if (this._currentValue) {
+                        Matrix.DecomposeLerpToRef(this._originalBlendValue, currentValue, this._blendingFactor, this._currentValue);
+                    } else {
+                        this._currentValue = Matrix.DecomposeLerp(this._originalBlendValue, currentValue, this._blendingFactor);
+                    }
+                } else {
+                    if (this._currentValue) {
+                        Matrix.LerpToRef(this._originalBlendValue, currentValue, this._blendingFactor, this._currentValue);
+                    } else {
+                        this._currentValue = Matrix.Lerp(this._originalBlendValue, currentValue, this._blendingFactor);
+                    }
+                }
+            } else {
+                this._currentValue = Animation._UniversalLerp(this._originalBlendValue, currentValue, this._blendingFactor);
+            }
+
+            const blendingSpeed = target && target.animationPropertiesOverride ? target.animationPropertiesOverride.blendingSpeed : this._animation.blendingSpeed;
+            // The record carries the factor this very write blended in with, so what the step blended can be read
+            // after the step whatever a write made since has moved the animation's own factor on to.
+            write.blendingFactor = this._blendingFactor;
+            this._blendingFactor += blendingSpeed;
+        } else {
+            write.blendingFactor = 1;
+            if (!this._currentValue) {
+                if (currentValue?.clone) {
+                    this._currentValue = currentValue.clone();
+                } else {
+                    this._currentValue = currentValue;
+                }
+            } else if (this._currentValue.copyFrom) {
+                this._currentValue.copyFrom(currentValue);
+            } else {
+                this._currentValue = currentValue;
+            }
+        }
+
+        if (weight !== -1.0) {
+            this._registerTargetForLateAnimationBinding(this, this._originalValue[targetIndex]);
+        } else {
+            if (this._animationState.loopMode === Animation.ANIMATIONLOOPMODE_RELATIVE_FROM_CURRENT) {
+                if (this._currentValue.addToRef) {
+                    this._currentValue.addToRef(this._originalValue[targetIndex], destination[this._targetPath]);
+                } else {
+                    destination[this._targetPath] = this._originalValue[targetIndex] + this._currentValue;
+                }
+            } else {
+                destination[this._targetPath] = this._currentValue;
+            }
+        }
+
+        if (target.markAsDirty) {
+            target.markAsDirty(this._animation.targetProperty);
+        }
+    }
+
+    /**
+     * Gets the loop pmode of the runtime animation
+     * @returns Loop Mode
+     */
+    private _getCorrectLoopMode(): number | undefined {
+        if (this._target && this._target.animationPropertiesOverride) {
+            // A morph target with no per-target override inherits the scene-level animationPropertiesOverride.
+            // That loop mode is meant for transform/bone animations: honoring it here would force the morph
+            // influence into (for example) RELATIVE mode and make it accumulate offset * repeatCount every loop.
+            // When the override is the inherited scene one, use the animation's own loop mode instead.
+            // An override set explicitly on the morph target is still respected.
+            const isMorphTarget = this._target.getClassName?.() === "MorphTarget";
+
+            // MorphTarget.animationPropertiesOverride getter inherits from the scene when no per-target override is set.
+
+            // Only bypass the override when it is truly inherited (ie. the target has no local override).
+
+            if (isMorphTarget && (this._target as any)._animationPropertiesOverride == null) {
+                return this._animation.loopMode;
+            }
+
+            return this._target.animationPropertiesOverride.loopMode as number;
+        }
+
+        return this._animation.loopMode;
+    }
+
+    /**
+     * Move the current animation to a given frame
+     * @param frame defines the frame to move to
+     * @param weight defines the weight to apply to the animation (-1.0 by default)
+     */
+    public goToFrame(frame: number, weight = -1): void {
+        const keys = this._animation.getKeys();
+
+        if (frame < keys[0].frame) {
+            frame = keys[0].frame;
+        } else if (frame > keys[keys.length - 1].frame) {
+            frame = keys[keys.length - 1].frame;
+        }
+
+        // Need to reset animation events
+        const events = this._events;
+        if (events.length) {
+            for (let index = 0; index < events.length; index++) {
+                if (!events[index].onlyOnce) {
+                    // reset events in the future
+                    events[index].isDone = events[index].frame < frame;
+                }
+            }
+        }
+
+        this._currentFrame = frame;
+        const currentValue = this._animation._interpolate(frame, this._animationState);
+
+        this.setValue(currentValue, weight);
+    }
+
+    /**
+     * @internal Internal use only
+     */
+    public _prepareForSpeedRatioChange(newSpeedRatio: number): void {
+        const newAbsoluteFrame = (this._previousElapsedTime * (this._animation.framePerSecond * newSpeedRatio)) / 1000.0;
+
+        this._absoluteFrameOffset = this._previousAbsoluteFrame - newAbsoluteFrame;
+    }
+
+    /**
+     * Execute the current animation
+     * @param elapsedTimeSinceAnimationStart defines the elapsed time (in milliseconds) since the animation was started
+     * @param from defines the lower frame of the animation range
+     * @param to defines the upper frame of the animation range
+     * @param loop defines if the current animation must loop
+     * @param speedRatio defines the current speed ratio
+     * @param weight defines the weight of the animation (default is -1 so no weight)
+     * @returns a boolean indicating if the animation is running
+     */
+    public animate(elapsedTimeSinceAnimationStart: number, from: number, to: number, loop: boolean, speedRatio: number, weight = -1.0): boolean {
+        const animation = this._animation;
+        const targetPropertyPath = animation.targetPropertyPath;
+        if (!targetPropertyPath || targetPropertyPath.length < 1) {
+            this._stopped = true;
+            return false;
+        }
+
+        let returnValue = true;
+        let currentFrame: number;
+        const events = this._events;
+        let frameRange: number;
+
+        if (!this._coreRuntimeAnimation) {
+            // Check limits
+            if (from < this._minFrame || from > this._maxFrame) {
+                from = this._minFrame;
+            }
+            if (to < this._minFrame || to > this._maxFrame) {
+                to = this._maxFrame;
+            }
+
+            frameRange = to - from;
+            let offsetValue: any;
+
+            // Compute the frame according to the elapsed time and the fps of the animation ("from" and "to" are not factored in!)
+            let absoluteFrame = (elapsedTimeSinceAnimationStart * (animation.framePerSecond * speedRatio)) / 1000.0 + this._absoluteFrameOffset;
+            let highLimitValue = 0;
+
+            // Apply the yoyo function if required
+            let yoyoLoop = false;
+            const yoyoMode = loop && this._animationState.loopMode === Animation.ANIMATIONLOOPMODE_YOYO;
+            if (yoyoMode) {
+                const position = (absoluteFrame - from) / frameRange;
+
+                // Apply the yoyo curve
+                const sin = Math.sin(position * Math.PI);
+                const yoyoPosition = Math.abs(sin);
+
+                // Map the yoyo position back to the range
+                absoluteFrame = yoyoPosition * frameRange + from;
+
+                const direction = sin >= 0 ? 1 : -1;
+                if (this._yoyoDirection !== direction) {
+                    yoyoLoop = true;
+                }
+
+                this._yoyoDirection = direction;
+            }
+
+            this._previousElapsedTime = elapsedTimeSinceAnimationStart;
+            this._previousAbsoluteFrame = absoluteFrame;
+
+            if (!loop && to >= from && ((absoluteFrame >= frameRange && speedRatio > 0) || (absoluteFrame <= 0 && speedRatio < 0))) {
+                // If we are out of range and not looping get back to caller
+                returnValue = false;
+                highLimitValue = animation.evaluate(to);
+            } else if (!loop && from >= to && ((absoluteFrame <= frameRange && speedRatio < 0) || (absoluteFrame >= 0 && speedRatio > 0))) {
+                returnValue = false;
+                highLimitValue = animation.evaluate(from);
+            } else if (this._animationState.loopMode !== Animation.ANIMATIONLOOPMODE_CYCLE) {
+                const keyOffset = to.toString() + from.toString();
+                if (!this._offsetsCache[keyOffset]) {
+                    this._animationState.repeatCount = 0;
+                    this._animationState.loopMode = Animation.ANIMATIONLOOPMODE_CYCLE; // force a specific codepath in animation._interpolate()!
+                    const fromValue = animation._interpolate(from, this._animationState);
+                    const toValue = animation._interpolate(to, this._animationState);
+
+                    this._animationState.loopMode = this._getCorrectLoopMode();
+                    switch (animation.dataType) {
+                        // Float
+                        case Animation.ANIMATIONTYPE_FLOAT:
+                            this._offsetsCache[keyOffset] = toValue - fromValue;
+                            break;
+                        // Quaternion
+                        case Animation.ANIMATIONTYPE_QUATERNION:
+                            this._offsetsCache[keyOffset] = toValue.subtract(fromValue);
+                            break;
+                        // Vector3
+                        case Animation.ANIMATIONTYPE_VECTOR3:
+                            this._offsetsCache[keyOffset] = toValue.subtract(fromValue);
+                            break;
+                        // Vector2
+                        case Animation.ANIMATIONTYPE_VECTOR2:
+                            this._offsetsCache[keyOffset] = toValue.subtract(fromValue);
+                            break;
+                        // Size
+                        case Animation.ANIMATIONTYPE_SIZE:
+                            this._offsetsCache[keyOffset] = toValue.subtract(fromValue);
+                            break;
+                        // Color3
+                        case Animation.ANIMATIONTYPE_COLOR3:
+                            this._offsetsCache[keyOffset] = toValue.subtract(fromValue);
+                            break;
+                        // Color4
+                        case Animation.ANIMATIONTYPE_COLOR4:
+                            this._offsetsCache[keyOffset] = toValue.subtract(fromValue);
+                            break;
+                        default:
+                            break;
+                    }
+
+                    this._highLimitsCache[keyOffset] = toValue;
+                }
+
+                highLimitValue = this._highLimitsCache[keyOffset];
+                offsetValue = this._offsetsCache[keyOffset];
+            }
+
+            if (offsetValue === undefined) {
+                switch (animation.dataType) {
+                    // Float
+                    case Animation.ANIMATIONTYPE_FLOAT:
+                        offsetValue = 0;
+                        break;
+                    // Quaternion
+                    case Animation.ANIMATIONTYPE_QUATERNION:
+                        offsetValue = _StaticOffsetValueQuaternion;
+                        break;
+                    // Vector3
+                    case Animation.ANIMATIONTYPE_VECTOR3:
+                        offsetValue = _StaticOffsetValueVector3;
+                        break;
+                    // Vector2
+                    case Animation.ANIMATIONTYPE_VECTOR2:
+                        offsetValue = _StaticOffsetValueVector2;
+                        break;
+                    // Size
+                    case Animation.ANIMATIONTYPE_SIZE:
+                        offsetValue = _StaticOffsetValueSize;
+                        break;
+                    // Color3
+                    case Animation.ANIMATIONTYPE_COLOR3:
+                        offsetValue = _StaticOffsetValueColor3;
+                        break;
+                    case Animation.ANIMATIONTYPE_COLOR4:
+                        offsetValue = _StaticOffsetValueColor4;
+                        break;
+                }
+            }
+
+            // Compute value
+
+            // The root this evaluation is clocked by, and the progress of the pose it gives, taken before any callback of
+            // the evaluation - a loop callback, an event - can synchronize the host with another root or move this one
+            const syncRoot = this._host ? this._host.syncRoot : null;
+            let syncFrames = this._playbackFrames;
+            let syncJumped = false;
+            if (syncRoot) {
+                // If we must sync with an animatable, calculate the current frame based on the frame of the root animatable
+                const syncRange = syncRoot.toFrame - syncRoot.fromFrame;
+                const masterFrame = syncRoot.masterFrame;
+                const hostNormalizedFrame = (masterFrame - syncRoot.fromFrame) / syncRange;
+                currentFrame = from + frameRange * hostNormalizedFrame;
+
+                const master = syncRoot.getAnimations()[0];
+                if (master && syncRange !== 0) {
+                    const phase = frameRange * hostNormalizedFrame;
+                    const masterEvaluated = master._playbackTo - master._playbackFrom;
+                    if (masterEvaluated !== 0 && master._playbackFrom <= syncRoot.fromFrame && master._playbackTo >= syncRoot.toFrame) {
+                        // The root's clock covers the range synchronized over: its whole cycles are whole cycles of the follower
+                        const masterCycles = Math.round((master._playbackFrames - (master._currentFrame - master._playbackFrom)) / masterEvaluated);
+                        syncFrames = frameRange * masterCycles + phase;
+                    } else {
+                        // Keyed shorter, the root never carries the follower to its end but snaps it back across its range,
+                        // which happens exactly when the root's own frame wraps: when that frame moves against the root's
+                        // playback. Both are the root's frames, so neither the follower's range nor the root's, whichever
+                        // way round each is, changes the comparison.
+                        syncJumped = (masterFrame - this._playbackSyncMasterFrame) * (master._playbackFrames - this._playbackSyncMasterPlayed) < 0;
+                        syncFrames = phase;
+                    }
+                    // A jump of the root is a jump of whatever follows it, down the chain
+                    syncJumped = syncJumped || master._playbackJumped;
+                    this._playbackSyncMasterPlayed = master._playbackFrames;
+                    this._playbackSyncMasterFrame = masterFrame;
+                }
+                // A root with no runtime animation reads as frame 0: the pose snaps there and holds, and so does the progress
+            } else {
+                if ((absoluteFrame > 0 && from > to) || (absoluteFrame < 0 && from < to)) {
+                    currentFrame = returnValue && frameRange !== 0 ? to + (absoluteFrame % frameRange) : from;
+                } else {
+                    currentFrame = returnValue && frameRange !== 0 ? from + (absoluteFrame % frameRange) : to;
+                }
+            }
+
+            // Reset event/state if looping
+            if ((!yoyoMode && ((speedRatio > 0 && this.currentFrame > currentFrame) || (speedRatio < 0 && this.currentFrame < currentFrame))) || (yoyoMode && yoyoLoop)) {
+                this._onLoop();
+
+                // Need to reset animation events
+                for (let index = 0; index < events.length; index++) {
+                    if (!events[index].onlyOnce) {
+                        // reset event, the animation is looping
+                        events[index].isDone = false;
+                    }
+                }
+
+                this._animationState.key = speedRatio > 0 ? 0 : animation.getKeys().length - 1;
+            }
+            this._currentFrame = currentFrame;
+            this._animationState.repeatCount = frameRange === 0 ? 0 : (absoluteFrame / frameRange) >> 0;
+            this._animationState.highLimitValue = highLimitValue;
+            this._animationState.offsetValue = offsetValue;
+
+            // The frame evaluated, unwrapped across loops, then the progress of the pose it gave
+            this._playbackFrom = from;
+            this._playbackTo = to;
+            this._playbackJumped = syncJumped;
+            this._playbackSyncRoot = syncRoot;
+            let frames: number;
+            if (syncRoot) {
+                frames = syncFrames;
+            } else if (!returnValue) {
+                // The end of the cycle the playback was in - however many it had been through before it stopped looping - or that cycle's start when it ran backwards
+                const cycles = frameRange !== 0 ? Math.floor(this._playbackFrames / frameRange) : 0;
+                frames = (currentFrame === to ? cycles + 1 : cycles) * frameRange;
+            } else if (yoyoMode) {
+                // At the far end of the swing the mapped frame is exactly `to`, which the fold above lands on `from`: the same pose, so the whole range
+                frames = currentFrame === from && absoluteFrame === to ? frameRange : currentFrame - from;
+            } else {
+                frames = absoluteFrame;
+            }
+            this._playbackFrames = frames;
+            // A constant loop holds its last value from its own second cycle on, whatever frame is evaluated
+            this._playbackProgress = this._animationState.loopMode === Animation.ANIMATIONLOOPMODE_CONSTANT && this._animationState.repeatCount > 0 ? frameRange : frames;
+        } else {
+            frameRange = to - from;
+            currentFrame = this._coreRuntimeAnimation.currentFrame;
+            this._currentFrame = currentFrame;
+            this._animationState.repeatCount = this._coreRuntimeAnimation._animationState.repeatCount;
+            this._animationState.highLimitValue = this._coreRuntimeAnimation._animationState.highLimitValue;
+            this._animationState.offsetValue = this._coreRuntimeAnimation._animationState.offsetValue;
+            this._playbackFrom = this._coreRuntimeAnimation._playbackFrom;
+            this._playbackTo = this._coreRuntimeAnimation._playbackTo;
+            this._playbackFrames = this._coreRuntimeAnimation._playbackFrames;
+            this._playbackProgress = this._coreRuntimeAnimation._playbackProgress;
+            this._playbackJumped = this._coreRuntimeAnimation._playbackJumped;
+            this._playbackSyncRoot = this._coreRuntimeAnimation._playbackSyncRoot;
+        }
+
+        const currentValue = animation._interpolate(currentFrame, this._animationState);
+
+        // Set value
+        this.setValue(currentValue, weight);
+
+        // Check events
+        if (events.length) {
+            for (let index = 0; index < events.length; index++) {
+                // Make sure current frame has passed event frame and that event frame is within the current range
+                // Also, handle both forward and reverse animations
+                if (
+                    (frameRange >= 0 && currentFrame >= events[index].frame && events[index].frame >= from) ||
+                    (frameRange < 0 && currentFrame <= events[index].frame && events[index].frame <= from)
+                ) {
+                    const event = events[index];
+                    if (!event.isDone) {
+                        // If event should be done only once, remove it.
+                        if (event.onlyOnce) {
+                            events.splice(index, 1);
+                            index--;
+                        }
+                        event.isDone = true;
+                        event.action(currentFrame);
+                    } // Don't do anything if the event has already been done.
+                }
+            }
+        }
+
+        if (!returnValue) {
+            this._stopped = true;
+        }
+
+        return returnValue;
+    }
+}

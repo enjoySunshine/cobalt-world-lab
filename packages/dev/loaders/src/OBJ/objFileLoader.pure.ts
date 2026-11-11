@@ -1,0 +1,442 @@
+/* eslint-disable @typescript-eslint/promise-function-async */
+import { type Nullable } from "core/types";
+import { Vector2 } from "core/Maths/math.vector.pure";
+import { Tools } from "core/Misc/tools.pure";
+import { type AbstractMesh } from "core/Meshes/abstractMesh";
+import {
+    type ISceneLoaderPluginAsync,
+    type ISceneLoaderPluginFactory,
+    type ISceneLoaderPlugin,
+    type ISceneLoaderAsyncResult,
+    type SceneLoaderPluginOptions,
+    RegisterSceneLoaderPlugin,
+} from "core/Loading/sceneLoader";
+import { AssetContainer } from "core/assetContainer";
+import { type Scene } from "core/scene";
+import { type WebRequest } from "core/Misc/webRequest";
+import { OBJFileLoaderMetadata } from "./objFileLoader.metadata";
+import { MTLFileLoader } from "./mtlFileLoader";
+import { type OBJLoadingOptions } from "./objLoadingOptions";
+import { SolidParser } from "./solidParser";
+import { type Mesh } from "core/Meshes/mesh.pure";
+import { StandardMaterial } from "core/Materials/standardMaterial.pure";
+import { type Geometry } from "core/Meshes/geometry";
+
+/**
+ * OBJ file type loader.
+ * This is a babylon scene loader plugin.
+ */
+export class OBJFileLoader implements ISceneLoaderPluginAsync, ISceneLoaderPluginFactory {
+    /**
+     * Defines the character encoding used to decode OBJ and MTL files.
+     */
+    public static ENCODING = "auto";
+    /**
+     * Defines if UVs are optimized by default during load.
+     */
+    public static OPTIMIZE_WITH_UV = true;
+    /**
+     * Invert model on y-axis (does a model scaling inversion)
+     */
+    public static INVERT_Y = false;
+    /**
+     * Invert Y-Axis of referenced textures on load
+     */
+    public static get INVERT_TEXTURE_Y() {
+        return MTLFileLoader.INVERT_TEXTURE_Y;
+    }
+
+    public static set INVERT_TEXTURE_Y(value: boolean) {
+        MTLFileLoader.INVERT_TEXTURE_Y = value;
+    }
+
+    /**
+     * Wait for referenced textures to finish loading before completing the OBJ load.
+     * Defaults to false for backwards compatibility.
+     */
+    public static WAIT_FOR_TEXTURES = false;
+
+    /**
+     * Include in meshes the vertex colors available in some OBJ files.  This is not part of OBJ standard.
+     */
+    public static IMPORT_VERTEX_COLORS = false;
+    /**
+     * Compute the normals for the model, even if normals are present in the file.
+     */
+    public static COMPUTE_NORMALS = false;
+    /**
+     * Optimize the normals for the model. Lighting can be uneven if you use OptimizeWithUV = true because new vertices can be created for the same location if they pertain to different faces.
+     * Using OptimizehNormals = true will help smoothing the lighting by averaging the normals of those vertices.
+     */
+    public static OPTIMIZE_NORMALS = false;
+    /**
+     * Defines custom scaling of UV coordinates of loaded meshes.
+     */
+    public static UV_SCALING = /*#__PURE__*/ new Vector2(1, 1);
+    /**
+     * Skip loading the materials even if defined in the OBJ file (materials are ignored).
+     */
+    public static SKIP_MATERIALS = false;
+
+    /**
+     * When a material fails to load OBJ loader will silently fail and onSuccess() callback will be triggered.
+     *
+     * Defaults to true for backwards compatibility.
+     */
+    public static MATERIAL_LOADING_FAILS_SILENTLY = true;
+
+    /**
+     * Loads assets without handedness conversions. This flag is for compatibility. Use it only if absolutely required. Defaults to false.
+     */
+    public static USE_LEGACY_BEHAVIOR = false;
+
+    /**
+     * Defines the name of the plugin.
+     */
+    public readonly name = OBJFileLoaderMetadata.name;
+    /**
+     * Defines the extension the plugin is able to load.
+     */
+    public readonly extensions = OBJFileLoaderMetadata.extensions;
+
+    private _assetContainer: Nullable<AssetContainer> = null;
+
+    private _loadingOptions: OBJLoadingOptions;
+
+    /**
+     * Creates loader for .OBJ files
+     *
+     * @param loadingOptions options for loading and parsing OBJ/MTL files.
+     */
+    constructor(loadingOptions?: Partial<Readonly<OBJLoadingOptions>>) {
+        this._loadingOptions = { ...OBJFileLoader._DefaultLoadingOptions, ...(loadingOptions ?? {}) };
+    }
+
+    private static get _DefaultLoadingOptions(): OBJLoadingOptions {
+        return {
+            encoding: OBJFileLoader.ENCODING,
+            computeNormals: OBJFileLoader.COMPUTE_NORMALS,
+            optimizeNormals: OBJFileLoader.OPTIMIZE_NORMALS,
+            importVertexColors: OBJFileLoader.IMPORT_VERTEX_COLORS,
+            invertY: OBJFileLoader.INVERT_Y,
+            invertTextureY: OBJFileLoader.INVERT_TEXTURE_Y,
+            waitForTextures: OBJFileLoader.WAIT_FOR_TEXTURES,
+            // eslint-disable-next-line @typescript-eslint/naming-convention
+            UVScaling: OBJFileLoader.UV_SCALING,
+            materialLoadingFailsSilently: OBJFileLoader.MATERIAL_LOADING_FAILS_SILENTLY,
+            optimizeWithUV: OBJFileLoader.OPTIMIZE_WITH_UV,
+            skipMaterials: OBJFileLoader.SKIP_MATERIALS,
+            useLegacyBehavior: OBJFileLoader.USE_LEGACY_BEHAVIOR,
+        };
+    }
+
+    /**
+     * Calls synchronously the MTL file attached to this obj.
+     * Load function or importMesh function don't enable to load 2 files in the same time asynchronously.
+     * Without this function materials are not displayed in the first frame (but displayed after).
+     * In consequence it is impossible to get material information in your HTML file
+     *
+     * @param url The URL of the MTL file
+     * @param rootUrl defines where to load data from
+     * @param onSuccess Callback function to be called when the MTL file is loaded
+     * @param onFailure
+     */
+    private _loadMTL(
+        url: string,
+        rootUrl: string,
+        onSuccess: (response: string | ArrayBuffer, responseUrl?: string) => any,
+        onFailure: (pathOfFile: string, exception?: any) => void
+    ) {
+        //The complete path to the mtl file
+        const pathOfFile = rootUrl + url;
+
+        // Loads through the babylon tools to allow fileInput search.
+        Tools.LoadFile(pathOfFile, onSuccess, undefined, undefined, true, (request?: WebRequest, exception?: any) => {
+            onFailure(pathOfFile, exception);
+        });
+    }
+
+    private _decode(data: string | ArrayBuffer): string {
+        if (typeof data === "string") {
+            return data;
+        }
+
+        const bytes = new Uint8Array(data);
+        const encoding = this._loadingOptions.encoding ?? "auto";
+        if (encoding !== "auto") {
+            return new TextDecoder(encoding).decode(bytes);
+        }
+
+        if (bytes[0] === 0xff && bytes[1] === 0xfe) {
+            return new TextDecoder("utf-16le").decode(bytes);
+        }
+        if (bytes[0] === 0xfe && bytes[1] === 0xff) {
+            return new TextDecoder("utf-16be").decode(bytes);
+        }
+
+        try {
+            return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+        } catch {
+            return new TextDecoder("gb18030").decode(bytes);
+        }
+    }
+
+    /** @internal */
+    createPlugin(options: SceneLoaderPluginOptions): ISceneLoaderPluginAsync | ISceneLoaderPlugin {
+        return new OBJFileLoader(options[OBJFileLoaderMetadata.name]);
+    }
+
+    /**
+     * If the data string can be loaded directly.
+     * @returns if the data can be loaded directly
+     */
+    public canDirectLoad(): boolean {
+        return false;
+    }
+
+    /**
+     * Imports one or more meshes from the loaded OBJ data and adds them to the scene
+     * @param meshesNames a string or array of strings of the mesh names that should be loaded from the file
+     * @param scene the scene the meshes should be added to
+     * @param data the OBJ data to load
+     * @param rootUrl root url to load from
+     * @returns a promise containing the loaded meshes, particles, skeletons and animations
+     */
+    // eslint-disable-next-line @typescript-eslint/promise-function-async, no-restricted-syntax
+    public importMeshAsync(meshesNames: any, scene: Scene, data: any, rootUrl: string): Promise<ISceneLoaderAsyncResult> {
+        //get the meshes from OBJ file
+        // eslint-disable-next-line github/no-then
+        return this._parseSolidAsync(meshesNames, scene, data, rootUrl).then((meshes) => {
+            const geometries: Geometry[] = [];
+            for (let i = 0; i < meshes.length; ++i) {
+                const geometry = (meshes[i] as Mesh).geometry;
+                if (geometry) {
+                    geometries.push(geometry);
+                }
+            }
+            return {
+                meshes: meshes,
+                particleSystems: [],
+                skeletons: [],
+                animationGroups: [],
+                transformNodes: [],
+                geometries: geometries,
+                lights: [],
+                spriteManagers: [],
+            };
+        });
+    }
+
+    /**
+     * Imports all objects from the loaded OBJ data and adds them to the scene
+     * @param scene the scene the objects should be added to
+     * @param data the OBJ data to load
+     * @param rootUrl root url to load from
+     * @returns a promise which completes when objects have been loaded to the scene
+     */
+    // eslint-disable-next-line no-restricted-syntax
+    public loadAsync(scene: Scene, data: string | ArrayBuffer, rootUrl: string): Promise<void> {
+        //Get the 3D model
+        // eslint-disable-next-line github/no-then
+        return this.importMeshAsync(null, scene, data, rootUrl).then(() => {
+            // return void
+        });
+    }
+
+    /**
+     * Load into an asset container.
+     * @param scene The scene to load into
+     * @param data The data to import
+     * @param rootUrl The root url for scene and resources
+     * @returns The loaded asset container
+     */
+    public async loadAssetContainerAsync(scene: Scene, data: string | ArrayBuffer, rootUrl: string): Promise<AssetContainer> {
+        const container = new AssetContainer(scene);
+        this._assetContainer = container;
+
+        try {
+            // Resources are collected as they are created, including before texture loading settles.
+            await this.importMeshAsync(null, scene, data, rootUrl);
+            return container;
+        } catch (ex) {
+            container.dispose();
+            throw ex;
+        } finally {
+            this._assetContainer = null;
+        }
+    }
+
+    /**
+     * Read the OBJ file and create an Array of meshes.
+     * Each mesh contains all information given by the OBJ and the MTL file.
+     * i.e. vertices positions and indices, optional normals values, optional UV values, optional material
+     * @param meshesNames defines a string or array of strings of the mesh names that should be loaded from the file
+     * @param scene defines the scene where are displayed the data
+     * @param data defines the content of the obj file
+     * @param rootUrl defines the path to the folder
+     * @returns the list of loaded meshes
+     */
+    // eslint-disable-next-line @typescript-eslint/promise-function-async, no-restricted-syntax
+    private _parseSolidAsync(meshesNames: any, scene: Scene, data: string | ArrayBuffer, rootUrl: string): Promise<Array<AbstractMesh>> {
+        let fileToLoad: string = ""; //The name of the mtlFile to load
+        const materialsFromMTLFile: MTLFileLoader = new MTLFileLoader();
+        const materialToUse: string[] = [];
+        const babylonMeshesArray: Array<Mesh> = []; //The mesh for babylon
+
+        data = this._decode(data);
+
+        // Sanitize data
+        data = data.replace(/#.*$/gm, "").trim();
+
+        // Main function
+        const solidParser = new SolidParser(materialToUse, babylonMeshesArray, this._loadingOptions);
+
+        solidParser.parse(meshesNames, data, scene, this._assetContainer, (fileName: string) => {
+            fileToLoad = fileName;
+        });
+
+        // load the materials
+        const mtlPromises: Array<Promise<void>> = [];
+        // Check if we have a file to load
+        if (fileToLoad !== "" && !this._loadingOptions.skipMaterials) {
+            // Load the MTL and optionally wait for the textures used by the selected meshes.
+            mtlPromises.push(
+                new Promise((resolve, reject) => {
+                    this._loadMTL(
+                        fileToLoad,
+                        rootUrl,
+                        async (dataLoaded) => {
+                            try {
+                                //Create materials thanks MTLLoader function
+                                const textureLoadPromises = materialsFromMTLFile.parseMTL(
+                                    scene,
+                                    this._decode(dataLoaded),
+                                    rootUrl,
+                                    this._assetContainer,
+                                    this._loadingOptions.invertTextureY,
+                                    new Set(materialToUse),
+                                    this._loadingOptions.waitForTextures
+                                );
+                                // Parsing creates the selected materials synchronously; only their textures are pending.
+                                for (let n = 0; n < materialsFromMTLFile.materials.length; ++n) {
+                                    const material = materialsFromMTLFile.materials[n];
+                                    for (let index = materialToUse.indexOf(material.name); index !== -1; index = materialToUse.indexOf(material.name, index + 1)) {
+                                        const mesh = babylonMeshesArray[index];
+                                        mesh.material = material;
+
+                                        if (!mesh.getTotalIndices()) {
+                                            // No indices, we need to turn on point cloud
+                                            material.pointsCloud = true;
+                                        }
+                                    }
+                                }
+                                if (this._loadingOptions.waitForTextures) {
+                                    const results = await Promise.allSettled(textureLoadPromises);
+                                    const rejected = results.find((result) => result.status === "rejected");
+                                    if (rejected) {
+                                        throw rejected.reason;
+                                    }
+                                }
+                                resolve();
+                            } catch (e) {
+                                Tools.Warn(`Error processing MTL file: '${fileToLoad}'`);
+                                if (this._loadingOptions.materialLoadingFailsSilently) {
+                                    resolve();
+                                } else {
+                                    // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors
+                                    reject(e);
+                                }
+                            }
+                        },
+                        (pathOfFile: string, exception?: any) => {
+                            Tools.Warn(`Error downloading MTL file: '${fileToLoad}'`);
+                            if (this._loadingOptions.materialLoadingFailsSilently) {
+                                resolve();
+                            } else {
+                                // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors
+                                reject(exception);
+                            }
+                        }
+                    );
+                })
+            );
+        }
+        //Return an array with all Mesh
+        // eslint-disable-next-line github/no-then
+        return Promise.all(mtlPromises).then(() => {
+            const isLine = (mesh: AbstractMesh) => Boolean(mesh._internalMetadata?.["_isLine"] ?? false);
+
+            // Iterate over the mesh, determine if it is a line mesh, clone or modify the material to line rendering.
+            babylonMeshesArray.forEach((mesh) => {
+                if (isLine(mesh)) {
+                    let mat = mesh.material;
+                    if (!mat) {
+                        mat = scene._executeWithBlockedEntityCollection(!!this._assetContainer, () => {
+                            mat = new StandardMaterial(mesh.name + "_line", scene);
+                            mat._parentContainer = this._assetContainer;
+                            this._assetContainer?.materials.push(mat);
+                            return mat;
+                        });
+                    }
+                    // If another mesh is using this material and it is not a line then we need to clone it.
+                    const needClone = mat.getBindedMeshes().filter((e) => !isLine(e)).length > 0;
+                    if (needClone) {
+                        // Clone only the material; keep the MTL texture objects shared.
+                        const sourceMaterial = mat as StandardMaterial;
+                        const { ambientTexture, diffuseTexture, specularTexture, bumpTexture, opacityTexture } = sourceMaterial;
+                        const lineMaterial = scene._executeWithBlockedEntityCollection(!!this._assetContainer, () => {
+                            sourceMaterial.ambientTexture = null;
+                            sourceMaterial.diffuseTexture = null;
+                            sourceMaterial.specularTexture = null;
+                            sourceMaterial.bumpTexture = null;
+                            sourceMaterial.opacityTexture = null;
+                            try {
+                                const result = sourceMaterial.clone(sourceMaterial.name + "_line");
+                                result._parentContainer = this._assetContainer;
+                                this._assetContainer?.materials.push(result);
+                                return result;
+                            } finally {
+                                sourceMaterial.ambientTexture = ambientTexture;
+                                sourceMaterial.diffuseTexture = diffuseTexture;
+                                sourceMaterial.specularTexture = specularTexture;
+                                sourceMaterial.bumpTexture = bumpTexture;
+                                sourceMaterial.opacityTexture = opacityTexture;
+                            }
+                        });
+                        lineMaterial.ambientTexture = ambientTexture;
+                        lineMaterial.diffuseTexture = diffuseTexture;
+                        lineMaterial.specularTexture = specularTexture;
+                        lineMaterial.bumpTexture = bumpTexture;
+                        lineMaterial.opacityTexture = opacityTexture;
+                        mat = lineMaterial;
+                    }
+                    mat.wireframe = true;
+                    mesh.material = mat;
+                }
+            });
+            babylonMeshesArray.forEach((mesh) => {
+                if (mesh._internalMetadata) {
+                    mesh._internalMetadata["_isLine"] = undefined;
+                }
+            });
+
+            return babylonMeshesArray;
+        });
+    }
+}
+
+//Add this loader into the register plugin
+
+let _Registered = false;
+/**
+ * Registers the OBJFileLoader scene loader plugin.
+ * Safe to call multiple times; only the first call has an effect.
+ */
+export function RegisterOBJFileLoader(): void {
+    if (_Registered) {
+        return;
+    }
+    _Registered = true;
+
+    RegisterSceneLoaderPlugin(new OBJFileLoader());
+}

@@ -1,0 +1,993 @@
+/**
+ * Tests for textureProcessor.ts.
+ *
+ * The processor has two execution paths:
+ *
+ *   CPU path  – both operands are constant (texture: null). All math happens in JavaScript
+ *               and no ProceduralTexture is ever created. Tests here need no engine or scene.
+ *
+ *   GPU path  – at least one operand carries a texture. A ProceduralTexture is created,
+ *               shader defines and uniforms are set, then the texture is rendered.
+ *               ProceduralTexture is mocked below so these tests run without a WebGL context.
+ *               Pixel-level correctness (OUTPUT_SRGB waveform, bilinear accuracy, etc.)
+ *               requires a real GPU and belongs in the visualization test suite.
+ */
+
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { Color4 } from "core/Maths/math.color";
+import { Constants } from "core/Engines/constants";
+import { Logger } from "core/Misc/logger";
+import {
+    MultiplyTexturesAsync,
+    MaxTexturesAsync,
+    DivideTexturesAsync,
+    LerpTexturesAsync,
+    ThinWalledScatterWeightsAsync,
+    InvertTextureAsync,
+    ExtractMaxChannelAsync,
+    ExtractChannelAsync,
+    MultiScatterToSingleScatterAlbedoAsync,
+    SingleScatterToMultiScatterAlbedoAsync,
+    CreateFactorOperand,
+    CreateTextureWithFactorOperand,
+    ChannelMask,
+    TextureChannel,
+    TextureColorSpace,
+    TransmissionFractionAsync,
+    TransmissionScatterToSingleScatterAlbedoAsync,
+    type ITextureProcessOperand,
+} from "core/Materials/Textures/textureProcessor";
+
+// ── sRGB helpers (IEC 61966-2-1, mirrors the shader formulas) ─────────────────
+
+/**
+ * sRGB → linear (matches OPERAND_X_SRGB in the fragment shader)
+ * @param v - sRGB-encoded value in [0, 1]
+ * @returns Linear value
+ */
+function srgbToLinear(v: number): number {
+    return v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
+}
+
+/**
+ * linear → sRGB (matches OUTPUT_SRGB in the fragment shader)
+ * @param v - Linear value in [0, 1]
+ * @returns sRGB-encoded value
+ */
+function linearToSrgb(v: number): number {
+    return v <= 0.0031308 ? v * 12.92 : 1.055 * v ** (1 / 2.4) - 0.055;
+}
+
+// ── ProceduralTexture mock ─────────────────────────────────────────────────────
+//
+// Vitest hoists vi.mock() calls before any imports execute, so variables referenced
+// inside the factory must also be hoisted with vi.hoisted().
+
+const _capturedPTs = vi.hoisted(() => [] as InstanceType<ReturnType<typeof _makeFakePTClass>>[]); // filled by constructor
+
+// Factory separated so TypeScript can infer the instance type for assertions.
+function _makeFakePTClass() {
+    const fakeEffect = {
+        executeWhenCompiled(cb: (e: unknown) => void) {
+            cb(fakeEffect);
+        },
+        isReady: () => true,
+    };
+
+    class FakeProceduralTexture {
+        name: string;
+        defines: string = "";
+        refreshRate: number = 1;
+
+        // UV-transform metadata copied by _CopyTextureMetadata
+        coordinatesIndex: number = 0;
+        wrapU: number = 1;
+        wrapV: number = 1;
+        uOffset: number = 0;
+        vOffset: number = 0;
+        uScale: number = 1;
+        vScale: number = 1;
+        wAng: number = 0;
+
+        disposed: boolean = false;
+        options: unknown;
+
+        constructor(name: string, _size: unknown, _shader: string, _scene: unknown, options: unknown) {
+            this.name = name;
+            this.options = options;
+            _capturedPTs.push(this);
+        }
+
+        isReady() {
+            return true;
+        }
+        executeWhenReady(func: (texture: unknown) => void) {
+            // isReady() always returns true in this mock, so the callback fires immediately.
+            func(this);
+        }
+        getEffect() {
+            return fakeEffect;
+        }
+        /**
+         * Return a minimal scene stub so the proceduralTextures splice in _CreateProcessorTexture
+         * runs without error. The texture is not actually added to the list by the mock constructor,
+         * so indexOf returns -1 and the splice is a no-op.
+         * @returns Minimal scene-like object
+         */
+        getScene() {
+            return { proceduralTextures: [] };
+        }
+        render() {}
+        dispose() {
+            this.disposed = true;
+        }
+
+        // Required when this PT is later passed as an operand to another operation.
+        getSize() {
+            return { width: 4, height: 4 };
+        }
+        getTextureMatrix() {
+            // Identity — no UV transform on a freshly-created output texture.
+            return { isIdentity: () => true, equals: (other: any) => other === this.getTextureMatrix() };
+        }
+
+        setTexture(_name: string, _tex: unknown) {}
+        setColor4(_name: string, _val: unknown) {}
+        setMatrix(_name: string, _mat: unknown) {}
+        setFloat(_name: string, _val: number) {}
+
+        /**
+         * Parse the #define block into a plain string array for convenient assertions.
+         * @returns Array of define names
+         */
+        getDefines(): string[] {
+            return this.defines
+                .split("\n")
+                .map((l) => l.replace(/^#define\s+/, "").trim())
+                .filter(Boolean);
+        }
+    }
+
+    return FakeProceduralTexture;
+}
+
+vi.mock("core/Materials/Textures/Procedurals/proceduralTexture", () => ({
+    ProceduralTexture: _makeFakePTClass(),
+}));
+
+vi.mock("core/Materials/Textures/Procedurals/proceduralTexture.pure", () => ({
+    ProceduralTexture: _makeFakePTClass(),
+}));
+
+// ── Fake scene / engine helpers ───────────────────────────────────────────────
+
+/**
+ * Minimal scene stub required by _CreateProcessorTexture.
+ * Only `scene.getEngine().isWebGPU` and `scene.getEngine().getCaps()` are accessed before the
+ * ProceduralTexture constructor (which is mocked), so these are the only things we need.
+ * @param caps - Optional engine caps returned by `getCaps()`
+ * @returns Minimal scene-like object
+ */
+function makeFakeScene(caps: Record<string, unknown> = {}) {
+    return {
+        getEngine: () => ({ isWebGPU: false, getCaps: () => caps }),
+    } as any;
+}
+
+// ── Fake-texture helper ───────────────────────────────────────────────────────
+
+interface FakeTextureOpts {
+    /** UV translation x (non-zero makes the transform non-identity) */
+    uOffset?: number;
+    vOffset?: number;
+    uScale?: number;
+    vScale?: number;
+    wAng?: number;
+    /** Unique id used by equals() – two textures with the same id share the same transform */
+    matId?: number;
+}
+
+let _nextMatId = 0;
+
+/**
+ * Create a minimal texture-like object that satisfies the surface checked by textureProcessor
+ * internals (_HasNonIdentityTransform, _AllTransformsMatch, _CopyTextureMetadata, _ResolveOutputSize).
+ * @param opts - Optional UV transform and identity overrides
+ * @returns Minimal texture-like object
+ */
+function makeFakeTexture(opts: FakeTextureOpts = {}): ITextureProcessOperand["texture"] {
+    const uOffset = opts.uOffset ?? 0;
+    const vOffset = opts.vOffset ?? 0;
+    const uScale = opts.uScale ?? 1;
+    const vScale = opts.vScale ?? 1;
+    const wAng = opts.wAng ?? 0;
+    const matId = opts.matId ?? _nextMatId++;
+
+    const isId = uOffset === 0 && vOffset === 0 && uScale === 1 && vScale === 1 && wAng === 0;
+
+    // Fake Matrix: only isIdentity() and equals() are called by textureProcessor.
+    const mat: { isIdentity: () => boolean; equals: (other: any) => boolean; _matId: number } = {
+        isIdentity: () => isId,
+        equals: (other: typeof mat) => other._matId === matId,
+        _matId: matId,
+    };
+
+    return {
+        getSize: () => ({ width: 4, height: 4 }),
+        getTextureMatrix: () => mat,
+        // Properties read by _CopyTextureMetadata
+        coordinatesIndex: 0,
+        wrapU: 1,
+        wrapV: 1,
+        uOffset,
+        vOffset,
+        uScale,
+        vScale,
+        wAng,
+    } as unknown as ITextureProcessOperand["texture"];
+}
+
+// ── Test suite ────────────────────────────────────────────────────────────────
+
+describe("TextureProcessor", () => {
+    let scene: any;
+
+    beforeEach(() => {
+        _capturedPTs.length = 0;
+        _nextMatId = 0;
+        scene = makeFakeScene();
+    });
+
+    // ── 1. CPU constant fold ───────────────────────────────────────────────────
+
+    describe("CPU constant fold — no GPU pass", () => {
+        it("Multiply: computes component-wise product and returns texture:null", async () => {
+            const a = CreateFactorOperand(new Color4(0.5, 0.4, 0.3, 0.2));
+            const b = CreateFactorOperand(new Color4(2.0, 0.5, 1.0, 0.0));
+            const r = await MultiplyTexturesAsync("t", a, b, scene);
+
+            expect(r.texture).toBeNull();
+            expect(r.dispose).toBeUndefined();
+            expect(r.factor?.r).toBeCloseTo(1.0); // 0.5 * 2.0
+            expect(r.factor?.g).toBeCloseTo(0.2); // 0.4 * 0.5
+            expect(r.factor?.b).toBeCloseTo(0.3); // 0.3 * 1.0
+            expect(r.factor?.a).toBeCloseTo(0.0); // 0.2 * 0.0
+            expect(_capturedPTs).toHaveLength(0); // no GPU pass
+        });
+
+        it("Max: computes component-wise maximum", async () => {
+            const a = CreateFactorOperand(new Color4(0.2, 0.8, 0.1, 0.5));
+            const b = CreateFactorOperand(new Color4(0.6, 0.3, 0.9, 0.5));
+            const r = await MaxTexturesAsync("t", a, b, scene);
+
+            expect(r.texture).toBeNull();
+            expect(r.factor?.r).toBeCloseTo(0.6);
+            expect(r.factor?.g).toBeCloseTo(0.8);
+            expect(r.factor?.b).toBeCloseTo(0.9);
+            expect(r.factor?.a).toBeCloseTo(0.5);
+        });
+
+        it("TransmissionFraction: computes T / (T + S(1 - T)) without cancelling small weights", async () => {
+            const t = CreateFactorOperand(new Color4(0.001, 0.4, 0, 1));
+            const s = CreateFactorOperand(new Color4(0.001, 0.6, 0, 0.5));
+            const r = await TransmissionFractionAsync("t", t, s, scene);
+
+            expect(r.texture).toBeNull();
+            expect(r.factor?.r).toBeCloseTo(0.001 / (0.001 + 0.001 * 0.999), 6);
+            expect(r.factor?.g).toBeCloseTo(0.4 / (0.4 + 0.6 * 0.6), 6);
+            expect(r.factor?.b).toBe(0); // T = S = 0 is guarded rather than NaN
+            expect(r.factor?.a).toBeCloseTo(1);
+        });
+
+        it("TransmissionScatterToSingleScatterAlbedo: shifts negative absorption like the renderer", async () => {
+            const color = CreateFactorOperand(new Color4(0.5, 0.5, 0.5, 1));
+            const scatter = CreateFactorOperand(new Color4(1, 0.5, 0.5, 0.25));
+            const r = await TransmissionScatterToSingleScatterAlbedoAsync("t", color, scatter, scene);
+
+            // Absorption -log(0.5) - scatter is negative in red, so every channel shifts and the extinction is 1.
+            expect(r.texture).toBeNull();
+            expect(r.factor?.r).toBeCloseTo(1, 6);
+            expect(r.factor?.g).toBeCloseTo(0.5, 6);
+            expect(r.factor?.b).toBeCloseTo(0.5, 6);
+            expect(r.factor?.a).toBeCloseTo(0.25);
+        });
+
+        it("TransmissionScatterToSingleScatterAlbedo: divides by -log(color) without negative absorption, clamping zero", async () => {
+            const color = CreateFactorOperand(new Color4(0.5, 0, 0.9, 1));
+            const scatter = CreateFactorOperand(new Color4(0.2, 2, 0.05, 1));
+            const r = await TransmissionScatterToSingleScatterAlbedoAsync("t", color, scatter, scene);
+
+            expect(r.factor?.r).toBeCloseTo(0.2 / Math.LN2, 6);
+            expect(r.factor?.g).toBeCloseTo(2 / -Math.log(1e-7), 6);
+            expect(r.factor?.b).toBeCloseTo(0.05 / -Math.log(0.9), 6);
+        });
+
+        it("Lerp: t=0 returns a", async () => {
+            const a = CreateFactorOperand(new Color4(0.2, 0.4, 0.6, 0.8));
+            const b = CreateFactorOperand(new Color4(1.0, 1.0, 1.0, 1.0));
+            const t = CreateFactorOperand(new Color4(0.0, 0.0, 0.0, 0.0));
+            const r = await LerpTexturesAsync("t", a, b, t, scene);
+
+            expect(r.texture).toBeNull();
+            expect(r.factor?.r).toBeCloseTo(0.2);
+            expect(r.factor?.g).toBeCloseTo(0.4);
+            expect(r.factor?.b).toBeCloseTo(0.6);
+            expect(r.factor?.a).toBeCloseTo(0.8);
+        });
+
+        it("Lerp: t=1 returns b", async () => {
+            const a = CreateFactorOperand(new Color4(0.0, 0.0, 0.0, 0.0));
+            const b = CreateFactorOperand(new Color4(0.3, 0.6, 0.9, 0.5));
+            const t = CreateFactorOperand(new Color4(1.0, 1.0, 1.0, 1.0));
+            const r = await LerpTexturesAsync("t", a, b, t, scene);
+
+            expect(r.factor?.r).toBeCloseTo(0.3);
+            expect(r.factor?.g).toBeCloseTo(0.6);
+            expect(r.factor?.b).toBeCloseTo(0.9);
+            expect(r.factor?.a).toBeCloseTo(0.5);
+        });
+
+        it("Lerp: t=0.5 returns midpoint", async () => {
+            const a = CreateFactorOperand(new Color4(0.0, 0.0, 0.0, 0.0));
+            const b = CreateFactorOperand(new Color4(1.0, 1.0, 1.0, 1.0));
+            const t = CreateFactorOperand(new Color4(0.5, 0.5, 0.5, 0.5));
+            const r = await LerpTexturesAsync("t", a, b, t, scene);
+
+            expect(r.factor?.r).toBeCloseTo(0.5);
+            expect(r.factor?.g).toBeCloseTo(0.5);
+            expect(r.factor?.b).toBeCloseTo(0.5);
+            expect(r.factor?.a).toBeCloseTo(0.5);
+        });
+
+        it("Invert: RGBA (default) inverts all four channels", async () => {
+            const r = await InvertTextureAsync("t", CreateFactorOperand(new Color4(0.2, 0.4, 0.6, 0.8)), scene);
+
+            expect(r.texture).toBeNull();
+            expect(r.factor?.r).toBeCloseTo(0.8);
+            expect(r.factor?.g).toBeCloseTo(0.6);
+            expect(r.factor?.b).toBeCloseTo(0.4);
+            expect(r.factor?.a).toBeCloseTo(0.2);
+        });
+
+        it("Invert: ChannelMask.R inverts only R, leaves G B A unchanged", async () => {
+            const r = await InvertTextureAsync("t", CreateFactorOperand(new Color4(0.2, 0.4, 0.6, 0.8)), scene, ChannelMask.R);
+
+            expect(r.factor?.r).toBeCloseTo(0.8); // 1 − 0.2
+            expect(r.factor?.g).toBeCloseTo(0.4); // unchanged
+            expect(r.factor?.b).toBeCloseTo(0.6); // unchanged
+            expect(r.factor?.a).toBeCloseTo(0.8); // unchanged
+        });
+
+        it("Invert: ChannelMask.RGB inverts R G B, leaves A unchanged", async () => {
+            const r = await InvertTextureAsync("t", CreateFactorOperand(new Color4(0.2, 0.4, 0.6, 0.8)), scene, ChannelMask.RGB);
+
+            expect(r.factor?.r).toBeCloseTo(0.8);
+            expect(r.factor?.g).toBeCloseTo(0.6);
+            expect(r.factor?.b).toBeCloseTo(0.4);
+            expect(r.factor?.a).toBeCloseTo(0.8); // unchanged
+        });
+
+        it("ExtractMaxChannel: broadcasts max(r,g,b) to RGB, preserves alpha", async () => {
+            const r = await ExtractMaxChannelAsync("t", CreateFactorOperand(new Color4(0.3, 0.7, 0.5, 0.9)), scene);
+
+            expect(r.texture).toBeNull();
+            expect(r.factor?.r).toBeCloseTo(0.7);
+            expect(r.factor?.g).toBeCloseTo(0.7);
+            expect(r.factor?.b).toBeCloseTo(0.7);
+            expect(r.factor?.a).toBeCloseTo(0.9); // alpha preserved
+        });
+
+        it("ExtractMaxChannel: includeAlpha=true includes alpha in max and broadcasts to all", async () => {
+            const r = await ExtractMaxChannelAsync("t", CreateFactorOperand(new Color4(0.3, 0.7, 0.5, 0.9)), scene, true);
+
+            expect(r.factor?.r).toBeCloseTo(0.9); // max(0.3, 0.7, 0.5, 0.9) = 0.9
+            expect(r.factor?.a).toBeCloseTo(0.9); // broadcast to alpha too
+        });
+
+        it("ExtractChannel: R broadcasts r to RGB, preserves alpha", async () => {
+            const r = await ExtractChannelAsync("t", CreateFactorOperand(new Color4(0.3, 0.5, 0.7, 0.9)), TextureChannel.R, scene);
+
+            expect(r.texture).toBeNull();
+            expect(r.factor?.r).toBeCloseTo(0.3);
+            expect(r.factor?.g).toBeCloseTo(0.3);
+            expect(r.factor?.b).toBeCloseTo(0.3);
+            expect(r.factor?.a).toBeCloseTo(0.9); // alpha preserved
+        });
+
+        it("ExtractChannel: G broadcasts g to RGB, preserves alpha", async () => {
+            const r = await ExtractChannelAsync("t", CreateFactorOperand(new Color4(0.3, 0.5, 0.7, 0.9)), TextureChannel.G, scene);
+
+            expect(r.factor?.r).toBeCloseTo(0.5);
+            expect(r.factor?.g).toBeCloseTo(0.5);
+            expect(r.factor?.b).toBeCloseTo(0.5);
+            expect(r.factor?.a).toBeCloseTo(0.9);
+        });
+
+        it("ExtractChannel: A broadcasts alpha to all four channels", async () => {
+            const r = await ExtractChannelAsync("t", CreateFactorOperand(new Color4(0.3, 0.5, 0.7, 0.9)), TextureChannel.A, scene);
+
+            expect(r.factor?.r).toBeCloseTo(0.9);
+            expect(r.factor?.g).toBeCloseTo(0.9);
+            expect(r.factor?.b).toBeCloseTo(0.9);
+            expect(r.factor?.a).toBeCloseTo(0.9);
+        });
+
+        it("MultiScatterToSingleScatterAlbedo: converts RGB and preserves alpha", async () => {
+            const r = await MultiScatterToSingleScatterAlbedoAsync("t", CreateFactorOperand(new Color4(0, 0.5, 1, 0.75)), scene);
+
+            expect(r.texture).toBeNull();
+            expect(r.factor?.r).toBeCloseTo(0, 4);
+            expect(r.factor?.g).toBeCloseTo(0.9117088547, 5);
+            expect(r.factor?.b).toBeCloseTo(1, 5);
+            expect(r.factor?.a).toBeCloseTo(0.75);
+        });
+
+        it("MultiScatterToSingleScatterAlbedo: scales constant multi-scatter before conversion", async () => {
+            const scaled = await MultiScatterToSingleScatterAlbedoAsync(
+                "t",
+                CreateFactorOperand(new Color4(0.5, 0.5, 0.5, 0.5)),
+                scene,
+                1,
+                CreateFactorOperand(new Color4(0.001, 0.001, 0.001, 0.5))
+            );
+            const product = await MultiScatterToSingleScatterAlbedoAsync("t", CreateFactorOperand(new Color4(0.0005, 0.0005, 0.0005, 0.25)), scene, 1);
+
+            expect(scaled.texture).toBeNull();
+            expect(scaled.factor?.r).toBeGreaterThan(0.9);
+            expect(scaled.factor?.r).toBeCloseTo(product.factor!.r, 6);
+            expect(scaled.factor?.a).toBeCloseTo(0.25);
+        });
+
+        it("MultiScatterToSingleScatterAlbedo: clamps RGB before conversion", async () => {
+            const r = await MultiScatterToSingleScatterAlbedoAsync("t", CreateFactorOperand(new Color4(-1, 2, 0, 1)), scene);
+
+            expect(r.factor?.r).toBeCloseTo(0, 4);
+            expect(r.factor?.g).toBeCloseTo(1, 5);
+            expect(r.factor?.b).toBeCloseTo(0, 4);
+        });
+
+        it("SingleScatterToMultiScatterAlbedo: converts RGB and preserves alpha", async () => {
+            const r = await SingleScatterToMultiScatterAlbedoAsync("t", CreateFactorOperand(new Color4(0, 0.9117088547, 1, 0.75)), scene);
+
+            expect(r.texture).toBeNull();
+            expect(r.factor?.r).toBeCloseTo(0, 5);
+            expect(r.factor?.g).toBeCloseTo(0.5, 4);
+            expect(r.factor?.b).toBeCloseTo(1, 5);
+            expect(r.factor?.a).toBeCloseTo(0.75);
+        });
+
+        it("SingleScatterToMultiScatterAlbedo: clamps RGB before conversion", async () => {
+            const r = await SingleScatterToMultiScatterAlbedoAsync("t", CreateFactorOperand(new Color4(-1, 2, 0, 1)), scene);
+
+            expect(r.factor?.r).toBeCloseTo(0, 5);
+            expect(r.factor?.g).toBeCloseTo(1, 5);
+            expect(r.factor?.b).toBeCloseTo(0, 5);
+        });
+
+        it("SingleScatterToMultiScatterAlbedo: is the inverse of MultiScatterToSingleScatterAlbedo", async () => {
+            const multi = new Color4(0.1, 0.42, 0.87, 1);
+            const single = await MultiScatterToSingleScatterAlbedoAsync("t", CreateFactorOperand(multi), scene);
+            const roundTrip = await SingleScatterToMultiScatterAlbedoAsync("t", CreateFactorOperand(single.factor!), scene);
+
+            expect(roundTrip.factor?.r).toBeCloseTo(multi.r, 3);
+            expect(roundTrip.factor?.g).toBeCloseTo(multi.g, 3);
+            expect(roundTrip.factor?.b).toBeCloseTo(multi.b, 3);
+        });
+
+        it("MultiScatterToSingleScatterAlbedo: anisotropy divides by (1 - aniso*s^2)", async () => {
+            const multi = new Color4(0.3, 0.3, 0.3, 1);
+            const iso = await MultiScatterToSingleScatterAlbedoAsync("t", CreateFactorOperand(multi), scene);
+            const aniso = await MultiScatterToSingleScatterAlbedoAsync("t", CreateFactorOperand(multi), scene, 0.5);
+
+            // rho_ss = 1 - s^2 (isotropic); the anisotropic result is that divided by (1 - aniso*s^2),
+            // so with s^2 = 1 - iso: aniso_result = iso / (1 - 0.5*(1 - iso)).
+            const s2 = 1 - iso.factor!.r;
+            const expected = iso.factor!.r / (1 - 0.5 * s2);
+            expect(aniso.factor?.r).toBeCloseTo(expected, 6);
+            // aniso = 0 must match the isotropic overload exactly.
+            const aniso0 = await MultiScatterToSingleScatterAlbedoAsync("t", CreateFactorOperand(multi), scene, 0);
+            expect(aniso0.factor?.r).toBeCloseTo(iso.factor!.r, 6);
+        });
+
+        it("SingleScatterToMultiScatterAlbedo: is the inverse of MultiScatterToSingleScatterAlbedo with anisotropy", async () => {
+            const multi = new Color4(0.1, 0.42, 0.87, 1);
+            const aniso = -0.3;
+            const single = await MultiScatterToSingleScatterAlbedoAsync("t", CreateFactorOperand(multi), scene, aniso);
+            const roundTrip = await SingleScatterToMultiScatterAlbedoAsync("t", CreateFactorOperand(single.factor!), scene, aniso);
+
+            expect(roundTrip.factor?.r).toBeCloseTo(multi.r, 3);
+            expect(roundTrip.factor?.g).toBeCloseTo(multi.g, 3);
+            expect(roundTrip.factor?.b).toBeCloseTo(multi.b, 3);
+        });
+
+        // The renderer clamps anisotropy to 0.9999. Unclamped, aniso = 1 makes s^2 = (1 - rho_ss) / (1 - rho_ss) = 1 for
+        // every albedo below 1, so the inverse would export a black multi-scatter color.
+        it("SingleScatterToMultiScatterAlbedo: clamps anisotropy like the renderer", async () => {
+            const single = CreateFactorOperand(new Color4(0.5, 0.5, 0.5, 1));
+            const atOne = await SingleScatterToMultiScatterAlbedoAsync("t", single, scene, 1);
+            const atClamp = await SingleScatterToMultiScatterAlbedoAsync("t", single, scene, 0.9999);
+            const atMinusOne = await SingleScatterToMultiScatterAlbedoAsync("t", single, scene, -1);
+            const atMinusClamp = await SingleScatterToMultiScatterAlbedoAsync("t", single, scene, -0.9999);
+
+            expect(atOne.factor!.r).toBeGreaterThan(1e-5);
+            expect(atOne.factor!.r).toBe(atClamp.factor!.r);
+            expect(atMinusOne.factor!.r).toBe(atMinusClamp.factor!.r);
+
+            // Converting back at the same anisotropy recovers the single-scatter albedo. The fitted forward and inverse
+            // coefficients agree to about 3% this close to s = 1.
+            const roundTrip = await MultiScatterToSingleScatterAlbedoAsync("t", CreateFactorOperand(atOne.factor!), scene, 1);
+            expect(Math.abs(roundTrip.factor!.r - 0.5)).toBeLessThan(0.02);
+        });
+
+        describe("outputChannelMask", () => {
+            it("ChannelMask.RGBA passes all channels unchanged", async () => {
+                const r = await MultiplyTexturesAsync(
+                    "t",
+                    CreateFactorOperand(new Color4(0.5, 0.6, 0.7, 0.8)),
+                    CreateFactorOperand(new Color4(1, 1, 1, 1)),
+                    scene,
+                    undefined,
+                    ChannelMask.RGBA
+                );
+                expect(r.factor?.r).toBeCloseTo(0.5);
+                expect(r.factor?.g).toBeCloseTo(0.6);
+                expect(r.factor?.b).toBeCloseTo(0.7);
+                expect(r.factor?.a).toBeCloseTo(0.8);
+            });
+
+            it("ChannelMask.RGB forces alpha to 1.0", async () => {
+                const r = await MultiplyTexturesAsync(
+                    "t",
+                    CreateFactorOperand(new Color4(0.5, 0.5, 0.5, 0.5)),
+                    CreateFactorOperand(new Color4(1, 1, 1, 1)),
+                    scene,
+                    undefined,
+                    ChannelMask.RGB
+                );
+                expect(r.factor?.r).toBeCloseTo(0.5);
+                expect(r.factor?.g).toBeCloseTo(0.5);
+                expect(r.factor?.b).toBeCloseTo(0.5);
+                expect(r.factor?.a).toBe(1.0);
+            });
+
+            it("ChannelMask.R zeros G and B, forces alpha to 1.0", async () => {
+                const r = await MultiplyTexturesAsync(
+                    "t",
+                    CreateFactorOperand(new Color4(0.5, 0.6, 0.7, 0.8)),
+                    CreateFactorOperand(new Color4(1, 1, 1, 1)),
+                    scene,
+                    undefined,
+                    ChannelMask.R
+                );
+                expect(r.factor?.r).toBeCloseTo(0.5);
+                expect(r.factor?.g).toBe(0);
+                expect(r.factor?.b).toBe(0);
+                expect(r.factor?.a).toBe(1.0);
+            });
+
+            it("ChannelMask.A zeros RGB", async () => {
+                const r = await MultiplyTexturesAsync(
+                    "t",
+                    CreateFactorOperand(new Color4(0.5, 0.6, 0.7, 0.8)),
+                    CreateFactorOperand(new Color4(1, 1, 1, 1)),
+                    scene,
+                    undefined,
+                    ChannelMask.A
+                );
+                expect(r.factor?.r).toBe(0);
+                expect(r.factor?.g).toBe(0);
+                expect(r.factor?.b).toBe(0);
+                expect(r.factor?.a).toBeCloseTo(0.8);
+            });
+
+            it("outputChannelMask applies to Invert CPU path", async () => {
+                // Invert all, then mask to RGB only → alpha becomes 1
+                const r = await InvertTextureAsync("t", CreateFactorOperand(new Color4(0.2, 0.4, 0.6, 0.8)), scene, ChannelMask.RGBA, undefined, ChannelMask.RGB);
+                expect(r.factor?.r).toBeCloseTo(0.8);
+                expect(r.factor?.g).toBeCloseTo(0.6);
+                expect(r.factor?.b).toBeCloseTo(0.4);
+                expect(r.factor?.a).toBe(1.0);
+            });
+
+            it("outputChannelMask applies to ExtractMaxChannel CPU path", async () => {
+                // Max channel of (0.3, 0.7, 0.5) = 0.7; mask to RGB → alpha 1
+                const r = await ExtractMaxChannelAsync("t", CreateFactorOperand(new Color4(0.3, 0.7, 0.5, 0.9)), scene, false, undefined, ChannelMask.RGB);
+                expect(r.factor?.r).toBeCloseTo(0.7);
+                expect(r.factor?.a).toBe(1.0);
+            });
+        });
+    });
+
+    // ── 2. sRGB formula round-trip ─────────────────────────────────────────────
+    //
+    // These tests verify the IEC 61966-2-1 formulas used in the shaders are
+    // mathematically correct. Pixel-level GPU correctness requires a visualization test.
+
+    describe("sRGB formula round-trip (IEC 61966-2-1)", () => {
+        const keyValues = [0, 0.04045, 0.5, 1.0];
+
+        for (const v of keyValues) {
+            it(`linearToSrgb(srgbToLinear(${v})) ≈ ${v}`, () => {
+                expect(linearToSrgb(srgbToLinear(v))).toBeCloseTo(v, 5);
+            });
+        }
+
+        it("srgbToLinear: 0 → 0, 1 → 1", () => {
+            expect(srgbToLinear(0)).toBeCloseTo(0);
+            expect(srgbToLinear(1)).toBeCloseTo(1);
+        });
+
+        it("linearToSrgb: 0 → 0, 1 → 1", () => {
+            expect(linearToSrgb(0)).toBeCloseTo(0);
+            expect(linearToSrgb(1)).toBeCloseTo(1);
+        });
+
+        it("srgbToLinear is monotonically increasing", () => {
+            const samples = [0, 0.04045, 0.1, 0.5, 0.9, 1.0];
+            for (let i = 1; i < samples.length; i++) {
+                expect(srgbToLinear(samples[i])).toBeGreaterThan(srgbToLinear(samples[i - 1]));
+            }
+        });
+    });
+
+    // ── 3. GPU path structure ──────────────────────────────────────────────────
+    //
+    // These tests use a mocked ProceduralTexture so they run without WebGL.
+    // They verify that the correct shader defines are set and that the result
+    // carries a texture and a dispose function.
+
+    describe("GPU path structure (single-texture operand)", () => {
+        it("returns non-null texture and dispose function", async () => {
+            const tex = makeFakeTexture();
+            const r = await MultiplyTexturesAsync("t", { texture: tex }, CreateFactorOperand(new Color4(1, 1, 1, 1)), scene);
+
+            expect(r.texture).not.toBeNull();
+            expect(typeof r.dispose).toBe("function");
+            expect(r.factor).toBeUndefined();
+            expect(_capturedPTs).toHaveLength(1); // exactly one GPU pass
+        });
+
+        it("dispose() releases the underlying ProceduralTexture", async () => {
+            const tex = makeFakeTexture();
+            const r = await MultiplyTexturesAsync("t", { texture: tex }, CreateFactorOperand(new Color4(1, 1, 1, 1)), scene);
+
+            expect(_capturedPTs[0].disposed).toBe(false);
+            r.dispose!();
+            expect(_capturedPTs[0].disposed).toBe(true);
+        });
+
+        it("emits OUTPUT_SRGB define when outputColorSpace=SRGB", async () => {
+            const tex = makeFakeTexture();
+            await MultiplyTexturesAsync("t", { texture: tex }, CreateFactorOperand(new Color4(1, 1, 1, 1)), scene, TextureColorSpace.SRGB);
+
+            expect(_capturedPTs[0].getDefines()).toContain("OUTPUT_SRGB");
+        });
+
+        it("does not emit OUTPUT_SRGB define when outputColorSpace is omitted", async () => {
+            const tex = makeFakeTexture();
+            await MultiplyTexturesAsync("t", { texture: tex }, CreateFactorOperand(new Color4(1, 1, 1, 1)), scene);
+
+            expect(_capturedPTs[0].getDefines()).not.toContain("OUTPUT_SRGB");
+        });
+
+        it("sets result.colorSpace when outputColorSpace=SRGB", async () => {
+            const tex = makeFakeTexture();
+            const r = await MultiplyTexturesAsync("t", { texture: tex }, CreateFactorOperand(new Color4(1, 1, 1, 1)), scene, TextureColorSpace.SRGB);
+
+            expect(r.colorSpace).toBe(TextureColorSpace.SRGB);
+        });
+
+        it("uses requested HDR type, trilinear sampling, and mipmaps", async () => {
+            const tex = makeFakeTexture();
+            await LerpTexturesAsync(
+                "t",
+                CreateFactorOperand(new Color4(0, 0, 0, 0)),
+                CreateFactorOperand(new Color4(4, 4, 4, 1)),
+                { texture: tex },
+                scene,
+                TextureColorSpace.Linear,
+                undefined,
+                {
+                    textureType: Constants.TEXTURETYPE_HALF_FLOAT,
+                    samplingMode: Constants.TEXTURE_TRILINEAR_SAMPLINGMODE,
+                    generateMipMaps: true,
+                }
+            );
+
+            expect(_capturedPTs[0].options).toMatchObject({
+                type: Constants.TEXTURETYPE_HALF_FLOAT,
+                samplingMode: Constants.TEXTURE_TRILINEAR_SAMPLINGMODE,
+                generateMipMaps: true,
+            });
+        });
+
+        it("emits OPERAND_A_TEXTURE define for texture operand", async () => {
+            const tex = makeFakeTexture();
+            await MultiplyTexturesAsync("t", { texture: tex }, CreateFactorOperand(new Color4(1, 1, 1, 1)), scene);
+
+            expect(_capturedPTs[0].getDefines()).toContain("OPERAND_A_TEXTURE");
+        });
+
+        it("emits OPERAND_A_SRGB define when input colorSpace=SRGB", async () => {
+            const tex = makeFakeTexture();
+            await MultiplyTexturesAsync("t", { texture: tex, colorSpace: TextureColorSpace.SRGB }, CreateFactorOperand(new Color4(1, 1, 1, 1)), scene);
+
+            expect(_capturedPTs[0].getDefines()).toContain("OPERAND_A_SRGB");
+        });
+
+        it("emits OPERAND_A_CHANNEL_G define when input channel=G", async () => {
+            const tex = makeFakeTexture();
+            await MultiplyTexturesAsync("t", { texture: tex, channel: TextureChannel.G }, CreateFactorOperand(new Color4(1, 1, 1, 1)), scene);
+
+            expect(_capturedPTs[0].getDefines()).toContain("OPERAND_A_CHANNEL_G");
+        });
+
+        it("emits OUTPUT_MASK_A_ONE define for ChannelMask.RGB", async () => {
+            const tex = makeFakeTexture();
+            await MultiplyTexturesAsync("t", { texture: tex }, CreateFactorOperand(new Color4(1, 1, 1, 1)), scene, undefined, ChannelMask.RGB);
+
+            const defs = _capturedPTs[0].getDefines();
+            expect(defs).toContain("OUTPUT_MASK_A_ONE");
+            expect(defs).not.toContain("OUTPUT_MASK_R_ZERO");
+            expect(defs).not.toContain("OUTPUT_MASK_G_ZERO");
+            expect(defs).not.toContain("OUTPUT_MASK_B_ZERO");
+        });
+
+        it("emits no output-mask defines for ChannelMask.RGBA", async () => {
+            const tex = makeFakeTexture();
+            await MultiplyTexturesAsync("t", { texture: tex }, CreateFactorOperand(new Color4(1, 1, 1, 1)), scene, undefined, ChannelMask.RGBA);
+
+            const defs = _capturedPTs[0].getDefines();
+            expect(defs).not.toContain("OUTPUT_MASK_R_ZERO");
+            expect(defs).not.toContain("OUTPUT_MASK_G_ZERO");
+            expect(defs).not.toContain("OUTPUT_MASK_B_ZERO");
+            expect(defs).not.toContain("OUTPUT_MASK_A_ONE");
+        });
+
+        it("InvertTextureAsync emits OP_INVERT and per-channel defines", async () => {
+            const tex = makeFakeTexture();
+            await InvertTextureAsync("t", { texture: tex }, scene, ChannelMask.RGB);
+
+            const defs = _capturedPTs[0].getDefines();
+            expect(defs).toContain("OP_INVERT");
+            expect(defs).toContain("INVERT_R");
+            expect(defs).toContain("INVERT_G");
+            expect(defs).toContain("INVERT_B");
+            expect(defs).not.toContain("INVERT_A");
+        });
+
+        it("ExtractMaxChannelAsync emits OP_CHANNEL_MAX, no CHANNEL_MAX_INCLUDE_ALPHA by default", async () => {
+            const tex = makeFakeTexture();
+            await ExtractMaxChannelAsync("t", { texture: tex }, scene);
+
+            const defs = _capturedPTs[0].getDefines();
+            expect(defs).toContain("OP_CHANNEL_MAX");
+            expect(defs).not.toContain("CHANNEL_MAX_INCLUDE_ALPHA");
+        });
+
+        it("ExtractMaxChannelAsync emits CHANNEL_MAX_INCLUDE_ALPHA when requested", async () => {
+            const tex = makeFakeTexture();
+            await ExtractMaxChannelAsync("t", { texture: tex }, scene, true);
+
+            expect(_capturedPTs[0].getDefines()).toContain("CHANNEL_MAX_INCLUDE_ALPHA");
+        });
+
+        it("MultiScatterToSingleScatterAlbedoAsync emits its conversion define", async () => {
+            const tex = makeFakeTexture();
+            await MultiScatterToSingleScatterAlbedoAsync("t", { texture: tex }, scene);
+
+            expect(_capturedPTs[0].getDefines()).toContain("OP_MULTI_SCATTER_TO_SINGLE_SCATTER");
+        });
+
+        it("MultiScatterToSingleScatterAlbedoAsync fuses the scale operand into the conversion pass", async () => {
+            await MultiScatterToSingleScatterAlbedoAsync(
+                "t",
+                CreateFactorOperand(new Color4(0.5, 0.5, 0.5, 1)),
+                scene,
+                1,
+                CreateTextureWithFactorOperand(makeFakeTexture(), new Color4(0.001, 0.001, 0.001, 1), TextureChannel.A)
+            );
+
+            expect(_capturedPTs).toHaveLength(1);
+            const defs = _capturedPTs[0].getDefines();
+            expect(defs).toContain("OP_MULTI_SCATTER_TO_SINGLE_SCATTER");
+            expect(defs).toContain("MULTI_SCATTER_SCALE_B");
+            expect(defs).toContain("OPERAND_B_TEXTURE");
+            expect(defs).toContain("OPERAND_B_CHANNEL_A");
+        });
+
+        it("TransmissionFractionAsync fuses the fraction into one pass with the requested output type", async () => {
+            await TransmissionFractionAsync("t", { texture: makeFakeTexture() }, { texture: makeFakeTexture() }, scene, undefined, undefined, {
+                textureType: Constants.TEXTURETYPE_FLOAT,
+            });
+
+            expect(_capturedPTs).toHaveLength(1);
+            expect(_capturedPTs[0].getDefines()).toContain("OP_TRANSMISSION_FRACTION");
+            expect(_capturedPTs[0].options).toMatchObject({ type: Constants.TEXTURETYPE_FLOAT });
+        });
+
+        it("TransmissionScatterToSingleScatterAlbedoAsync fuses the albedo recovery into one pass", async () => {
+            await TransmissionScatterToSingleScatterAlbedoAsync("t", CreateFactorOperand(new Color4(0.5, 0.5, 0.5, 1)), { texture: makeFakeTexture() }, scene);
+
+            expect(_capturedPTs).toHaveLength(1);
+            expect(_capturedPTs[0].getDefines()).toContain("OP_TRANSMISSION_SCATTER_ALBEDO");
+            expect(_capturedPTs[0].getDefines()).toContain("OPERAND_B_TEXTURE");
+        });
+
+        it("auto-disposes intermediate texture when result is consumed as operand", async () => {
+            const tex = makeFakeTexture();
+
+            // Pass first result directly as operand to second operation.
+            const intermediate = await MultiplyTexturesAsync("pass1", { texture: tex }, CreateFactorOperand(new Color4(1, 1, 1, 1)), scene);
+
+            expect(_capturedPTs[0].disposed).toBe(false);
+
+            const tex2 = makeFakeTexture();
+            await MultiplyTexturesAsync("pass2", intermediate, { texture: tex2 }, scene);
+
+            // The intermediate PT should have been disposed by the second pass.
+            expect(_capturedPTs[0].disposed).toBe(true);
+        });
+    });
+
+    // ── 4. UV-transform propagation ────────────────────────────────────────────
+
+    describe("UV transform propagation", () => {
+        it("matching transforms: UV offset is propagated to result, no MATRIX defines", async () => {
+            // Both operands share the same texture (and therefore the same transform).
+            const tex = makeFakeTexture({ uOffset: 0.25, vOffset: 0.1 });
+            const r = await MultiplyTexturesAsync("t", { texture: tex }, { texture: tex }, scene);
+
+            // _CopyTextureMetadata is called with includeTransform=true
+            const pt = _capturedPTs[0];
+            expect(pt.uOffset).toBeCloseTo(0.25);
+            expect(pt.vOffset).toBeCloseTo(0.1);
+
+            // bakeTransform=false → no MATRIX defines emitted
+            expect(pt.getDefines()).not.toContain("OPERAND_A_MATRIX");
+            expect(pt.getDefines()).not.toContain("OPERAND_B_MATRIX");
+
+            // The result operand should carry the texture (not be a constant)
+            expect(r.texture).not.toBeNull();
+        });
+
+        it("differing transforms: result has identity UV, defines include MATRIX for both operands", async () => {
+            // Two textures with different (non-identity) UV transforms.
+            const texA = makeFakeTexture({ uOffset: 0.25, matId: 1 });
+            const texB = makeFakeTexture({ uOffset: 0.5, matId: 2 });
+            await MultiplyTexturesAsync("t", { texture: texA }, { texture: texB }, scene);
+
+            const pt = _capturedPTs[0];
+
+            // _CopyTextureMetadata is called with includeTransform=false → UV stays at defaults
+            expect(pt.uOffset).toBe(0);
+            expect(pt.vOffset).toBe(0);
+
+            // bakeTransform=true → MATRIX defines are emitted so the shader applies them
+            expect(pt.getDefines()).toContain("OPERAND_A_MATRIX");
+            expect(pt.getDefines()).toContain("OPERAND_B_MATRIX");
+        });
+
+        it("matching UV sets keep both distinct textures without warning", async () => {
+            const warn = vi.spyOn(Logger, "Warn").mockImplementation(() => {});
+            await MultiplyTexturesAsync("matching-uv", { texture: makeFakeTexture() }, { texture: makeFakeTexture() }, scene);
+
+            expect(warn).not.toHaveBeenCalled();
+            expect(_capturedPTs[0].getDefines()).toContain("OPERAND_A_TEXTURE");
+            expect(_capturedPTs[0].getDefines()).toContain("OPERAND_B_TEXTURE");
+            warn.mockRestore();
+        });
+
+        it("single-texture operand: UV transform always propagated (InvertTextureAsync)", async () => {
+            const tex = makeFakeTexture({ uOffset: 0.3 });
+            await InvertTextureAsync("t", { texture: tex }, scene);
+
+            const pt = _capturedPTs[0];
+            expect(pt.uOffset).toBeCloseTo(0.3);
+            // Single operand → bakeTransform=false always, no MATRIX define
+            expect(pt.getDefines()).not.toContain("OPERAND_A_MATRIX");
+        });
+
+        it.each([
+            ["Multiply", MultiplyTexturesAsync],
+            ["Max", MaxTexturesAsync],
+            ["Divide", DivideTexturesAsync],
+            ["TransmissionFraction", TransmissionFractionAsync],
+            ["TransmissionScatterToSingleScatterAlbedo", TransmissionScatterToSingleScatterAlbedoAsync],
+        ])("%s drops a texture using a different UV set and disposes the discarded operand", async (_operation, process) => {
+            const warn = vi.spyOn(Logger, "Warn").mockImplementation(() => {});
+            const first = makeFakeTexture();
+            const second = makeFakeTexture();
+            second!.coordinatesIndex = 1;
+            const dispose = vi.fn();
+
+            await process("uv-mismatch", { texture: first }, { texture: second, factor: new Color4(0.5, 0.5, 0.5, 1), dispose }, scene);
+
+            expect(warn).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("uv-mismatch"));
+            expect(_capturedPTs[0].coordinatesIndex).toBe(0);
+            expect(_capturedPTs[0].getDefines()).toContain("OPERAND_A_TEXTURE");
+            expect(_capturedPTs[0].getDefines()).not.toContain("OPERAND_B_TEXTURE");
+            expect(dispose).toHaveBeenCalledOnce();
+            warn.mockRestore();
+        });
+
+        it("Lerp keeps all textures that share the first texture's UV set", async () => {
+            const warn = vi.spyOn(Logger, "Warn").mockImplementation(() => {});
+            const first = makeFakeTexture();
+            first!.coordinatesIndex = 2;
+            const second = makeFakeTexture();
+            second!.coordinatesIndex = 2;
+            const blend = makeFakeTexture();
+            blend!.coordinatesIndex = 1;
+
+            await LerpTexturesAsync("lerp-uv", { texture: first }, { texture: second }, { texture: blend }, scene);
+
+            expect(warn).toHaveBeenCalledOnce();
+            expect(_capturedPTs[0].coordinatesIndex).toBe(2);
+            expect(_capturedPTs[0].getDefines()).toContain("OPERAND_A_TEXTURE");
+            expect(_capturedPTs[0].getDefines()).toContain("OPERAND_B_TEXTURE");
+            expect(_capturedPTs[0].getDefines()).not.toContain("LERP_T_TEXTURE");
+            warn.mockRestore();
+        });
+
+        it("Lerp keeps later textures that share the first texture's UV set and drops the mismatched one", async () => {
+            const warn = vi.spyOn(Logger, "Warn").mockImplementation(() => {});
+            const first = makeFakeTexture();
+            first!.coordinatesIndex = 1;
+            const second = makeFakeTexture();
+            second!.coordinatesIndex = 0;
+            const blend = makeFakeTexture();
+            blend!.coordinatesIndex = 1;
+
+            await LerpTexturesAsync("lerp-uv-later", { texture: first }, { texture: second }, { texture: blend }, scene);
+
+            expect(warn).toHaveBeenCalledOnce();
+            expect(_capturedPTs[0].coordinatesIndex).toBe(1);
+            expect(_capturedPTs[0].getDefines()).toContain("OPERAND_A_TEXTURE");
+            expect(_capturedPTs[0].getDefines()).not.toContain("OPERAND_B_TEXTURE");
+            expect(_capturedPTs[0].getDefines()).toContain("LERP_T_TEXTURE");
+            warn.mockRestore();
+        });
+
+        it("ThinWalledScatterWeights warns once for mismatched UV sets", async () => {
+            const warn = vi.spyOn(Logger, "Warn").mockImplementation(() => {});
+            const transmission = makeFakeTexture();
+            const scatter = makeFakeTexture();
+            scatter!.coordinatesIndex = 1;
+
+            await ThinWalledScatterWeightsAsync("scatter-uv", { texture: transmission }, { texture: scatter }, scene);
+
+            expect(warn).toHaveBeenCalledOnce();
+            expect(_capturedPTs.every((pt) => pt.coordinatesIndex === 0)).toBe(true);
+            warn.mockRestore();
+        });
+
+        it("ThinWalledScatterWeights computes each weight in one pass without intermediates", async () => {
+            const transmissionDispose = vi.fn();
+            const scatterDispose = vi.fn();
+            const result = await ThinWalledScatterWeightsAsync(
+                "scatter-fused",
+                { texture: makeFakeTexture(), dispose: transmissionDispose },
+                { texture: makeFakeTexture(), dispose: scatterDispose },
+                scene
+            );
+
+            expect(_capturedPTs).toHaveLength(2);
+            expect(_capturedPTs[0]).toBe(result.transmission.texture);
+            expect(_capturedPTs[1]).toBe(result.subsurface.texture);
+            expect(_capturedPTs[0].getDefines()).toContain("OP_THIN_WALLED_TRANSMISSION_WEIGHT");
+            expect(_capturedPTs[1].getDefines()).toContain("OP_THIN_WALLED_SUBSURFACE_WEIGHT");
+            expect(_capturedPTs.every((pt) => (pt.options as { type: number }).type === Constants.TEXTURETYPE_UNSIGNED_BYTE)).toBe(true);
+            expect(_capturedPTs.some((pt) => pt.disposed)).toBe(false);
+            expect(transmissionDispose).toHaveBeenCalledOnce();
+            expect(scatterDispose).toHaveBeenCalledOnce();
+        });
+
+        it("ThinWalledScatterWeights constant path keeps a small subsurface weight near T = 1", async () => {
+            const result = await ThinWalledScatterWeightsAsync("scatter-const", { factor: new Color4(1, 1, 1, 1) }, { factor: new Color4(0.001, 0.001, 0.001, 1) }, scene);
+
+            expect(result.transmission.factor!.r).toBeCloseTo(0.999, 6);
+            expect(result.subsurface.factor!.r).toBeCloseTo(1, 6);
+        });
+    });
+});

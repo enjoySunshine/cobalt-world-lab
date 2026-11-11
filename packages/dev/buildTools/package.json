@@ -1,0 +1,22 @@
+{
+    "name": "@dev/build-tools",
+    "version": "1.0.0",
+    "main": "dist/index",
+    "module": "dist/index",
+    "types": "dist/index",
+    "private": true,
+    "files": [
+        "dist"
+    ],
+    "scripts": {
+        "build": "npm run compile",
+        "compile": "tsc -b tsconfig.build.json"
+    },
+    "sideEffects": true,
+    "bin": {
+        "build-tools": "./dist/index.js"
+    },
+    "dependencies": {
+        "dotenv": "^18.0.9"
+    }
+}

@@ -1,0 +1,8 @@
+/**
+ * Re-exports pure implementation and applies runtime side effects.
+ * Import cloudBlock.pure for tree-shakeable, side-effect-free usage.
+ */
+export * from "./cloudBlock.pure";
+
+import { RegisterCloudBlock } from "./cloudBlock.pure";
+RegisterCloudBlock();

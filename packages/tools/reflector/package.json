@@ -1,0 +1,22 @@
+{
+    "name": "@tools/reflector",
+    "version": "0.0.1",
+    "main": "index.js",
+    "type": "module",
+    "private": true,
+    "scripts": {
+        "build": "tsc -p tsconfig.build.json",
+        "start": "node ./dist/index.js",
+        "start:ssl": "node ./dist/index.js --ssl"
+    },
+    "devDependencies": {
+        "@types/ws": "^8.18.2"
+    },
+    "dependencies": {
+        "ws": "^8.22.0"
+    },
+    "optionalDependencies": {
+        "bufferutil": "^4.1.0",
+        "utf-8-validate": "^6.0.6"
+    }
+}

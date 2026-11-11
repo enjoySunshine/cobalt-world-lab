@@ -1,0 +1,155 @@
+import { serialize, serializeAsColor3, expandToProperty, serializeAsTexture } from "../../Misc/decorators";
+import { type Scene } from "../../scene";
+import { Color3 } from "../../Maths/math.color.pure";
+import { PBRBaseMaterial } from "./pbrBaseMaterial.pure";
+import { type BaseTexture } from "../../Materials/Textures/baseTexture";
+import { type Nullable } from "../../types";
+
+/**
+ * The Physically based simple base material of BJS.
+ *
+ * This enables better naming and convention enforcements on top of the pbrMaterial.
+ * It is used as the base class for both the specGloss and metalRough conventions.
+ */
+export abstract class PBRBaseSimpleMaterial extends PBRBaseMaterial {
+    /**
+     * Number of Simultaneous lights allowed on the material.
+     */
+    @serialize()
+    @expandToProperty("_markAllSubMeshesAsLightsDirty")
+    public accessor maxSimultaneousLights = 4;
+
+    /**
+     * If sets to true, disables all the lights affecting the material.
+     */
+    @serialize()
+    @expandToProperty("_markAllSubMeshesAsLightsDirty")
+    public accessor disableLighting = false;
+
+    /**
+     * Environment Texture used in the material (this is use for both reflection and environment lighting).
+     */
+    @serializeAsTexture()
+    @expandToProperty("_markAllSubMeshesAsTexturesDirty", "_reflectionTexture")
+    public accessor environmentTexture: Nullable<BaseTexture>;
+
+    /**
+     * If sets to true, x component of normal map value will invert (x = 1.0 - x).
+     */
+    @serialize()
+    @expandToProperty("_markAllSubMeshesAsTexturesDirty")
+    public accessor invertNormalMapX = false;
+
+    /**
+     * If sets to true, y component of normal map value will invert (y = 1.0 - y).
+     */
+    @serialize()
+    @expandToProperty("_markAllSubMeshesAsTexturesDirty")
+    public accessor invertNormalMapY = false;
+
+    /**
+     * Normal map used in the model.
+     */
+    @serializeAsTexture()
+    @expandToProperty("_markAllSubMeshesAsTexturesDirty", "_bumpTexture")
+    public accessor normalTexture: Nullable<BaseTexture>;
+
+    /**
+     * Emissivie color used to self-illuminate the model.
+     */
+    @serializeAsColor3("emissive")
+    @expandToProperty("_markAllSubMeshesAsTexturesDirty")
+    public accessor emissiveColor = new Color3(0, 0, 0);
+
+    /**
+     * Emissivie texture used to self-illuminate the model.
+     */
+    @serializeAsTexture()
+    @expandToProperty("_markAllSubMeshesAsTexturesDirty")
+    public accessor emissiveTexture: Nullable<BaseTexture>;
+
+    /**
+     * Occlusion Channel Strength.
+     */
+    @serialize()
+    @expandToProperty("_markAllSubMeshesAsTexturesDirty", "_ambientTextureStrength")
+    public accessor occlusionStrength: number = 1.0;
+
+    /**
+     * Occlusion Texture of the material (adding extra occlusion effects).
+     */
+    @serializeAsTexture()
+    @expandToProperty("_markAllSubMeshesAsTexturesDirty", "_ambientTexture")
+    public accessor occlusionTexture: Nullable<BaseTexture>;
+
+    /**
+     * Tangent-space bent normals in linear RGB. Combined with occlusionTexture to
+     * directionally occlude environment reflections without changing direct lighting.
+     * Uses a spherical-Gaussian approximation of visibility and the specular lobe.
+     * Bake the bent normal and cosine-weighted AO with matching occlusion distances.
+     * Without occlusionTexture this map has no effect; load it with gammaSpace set to false.
+     * The texture's level blends between unoccluded and fully bent-normal-occluded reflections (0..1).
+     * WebGL devices without high-precision fragment support use scalar AO instead.
+     * @see https://playground.babylonjs.com/#8N2ROI#5
+     */
+    @serializeAsTexture()
+    @expandToProperty("_markAllSubMeshesAsTexturesDirty")
+    public accessor bentNormalTexture: Nullable<BaseTexture>;
+
+    /**
+     * Defines the alpha limits in alpha test mode.
+     */
+    @serialize()
+    @expandToProperty("_markAllSubMeshesAsTexturesDirty", "_alphaCutOff")
+    public accessor alphaCutOff: number;
+
+    /**
+     * Gets the current double sided mode.
+     */
+    @serialize()
+    public get doubleSided(): boolean {
+        return this._twoSidedLighting;
+    }
+    /**
+     * If sets to true and backfaceCulling is false, normals will be flipped on the backside.
+     */
+    public set doubleSided(value: boolean) {
+        if (this._twoSidedLighting === value) {
+            return;
+        }
+        this._twoSidedLighting = value;
+        this.backFaceCulling = !value;
+        this._markAllSubMeshesAsTexturesDirty();
+    }
+
+    /**
+     * Stores the pre-calculated light information of a mesh in a texture.
+     */
+    @serializeAsTexture()
+    @expandToProperty("_markAllSubMeshesAsTexturesDirty", null)
+    public accessor lightmapTexture: Nullable<BaseTexture>;
+
+    /**
+     * If true, the light map contains occlusion information instead of lighting info.
+     */
+    @serialize()
+    @expandToProperty("_markAllSubMeshesAsTexturesDirty")
+    public accessor useLightmapAsShadowmap = false;
+
+    /**
+     * Instantiates a new PBRMaterial instance.
+     *
+     * @param name The material name
+     * @param scene The scene the material will be use in.
+     */
+    constructor(name: string, scene?: Scene) {
+        super(name, scene);
+
+        this._useAlphaFromAlbedoTexture = true;
+        this._useAmbientInGrayScale = true;
+    }
+
+    public override getClassName(): string {
+        return "PBRBaseSimpleMaterial";
+    }
+}

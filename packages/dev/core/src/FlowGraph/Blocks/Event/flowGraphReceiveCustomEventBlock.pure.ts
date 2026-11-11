@@ -1,0 +1,191 @@
+/** This file must only contain pure code and pure imports */
+
+import { type Observer } from "../../../Misc/observable.pure";
+import { type FlowGraphContext } from "../../flowGraphContext";
+import { FlowGraphEventBlock } from "../../flowGraphEventBlock";
+import { type Nullable } from "../../../types";
+import { Logger } from "../../../Misc/logger";
+import { type RichType, getRichTypeByFlowGraphType, RichTypeString } from "../../flowGraphRichTypes.pure";
+import { type FlowGraphDataConnection } from "../../flowGraphDataConnection.pure";
+import { type IFlowGraphBlockConfiguration } from "../../flowGraphBlock";
+import { FlowGraphBlockNames } from "../flowGraphBlockNames";
+import { FlowGraphCoordinator } from "core/FlowGraph/flowGraphCoordinator";
+import { RegisterClass } from "../../../Misc/typeStore";
+import { defaultValueSerializationFunction } from "../../serialization";
+/**
+ * Parameters used to create a FlowGraphReceiveCustomEventBlock.
+ */
+export interface IFlowGraphReceiveCustomEventBlockConfiguration extends IFlowGraphBlockConfiguration {
+    /**
+     * The id of the event to receive.
+     * This event id is unique to the environment (not the context).
+     */
+    eventId: string;
+    /**
+     * The names of the data outputs for that event. Should be in the same order as the event data in
+     * SendCustomEvent
+     */
+    eventData: { [key: string]: { type: RichType<any>; value?: any } };
+}
+
+/**
+ * Returns the event-dispatch key for an authored custom event id.
+ * @param eventId authored custom event id
+ * @returns namespaced event key
+ */
+export function GetFlowGraphCustomEventKey(eventId: string): string {
+    return `custom:${encodeURIComponent(eventId)}`;
+}
+
+/**
+ * A block that receives a custom event.
+ * It saves the event data in the data outputs, based on the provided eventData in the configuration. For example, if the event data is
+ * `{ x: { type: RichTypeNumber }, y: { type: RichTypeNumber } }`, the block will have two data outputs: x and y.
+ */
+export class FlowGraphReceiveCustomEventBlock extends FlowGraphEventBlock {
+    public override initPriority: number = 1;
+
+    /**
+     * Output: the opaque reference identifying the received event source.
+     * Receivers configured with the same event id share the same reference, so comparing their
+     * `event` outputs for equality succeeds. The reference format is owned by the host environment.
+     */
+    public readonly eventRef: FlowGraphDataConnection<string>;
+
+    /** @returns the configured custom event id */
+    public override get eventKey(): string {
+        return GetFlowGraphCustomEventKey(this.config.eventId);
+    }
+
+    constructor(
+        /**
+         * the configuration of the block
+         */
+        public override config: IFlowGraphReceiveCustomEventBlockConfiguration
+    ) {
+        super(config);
+        // use event data to register data outputs
+        for (const key of Object.keys(this.config.eventData ?? {})) {
+            const entry = this.config.eventData[key];
+            // Handle deserialized config where type may be a string typeName, a plain object
+            // with a typeName property (from old JSON serialization), or a proper RichType instance.
+            const typeKey = typeof entry.type === "string" ? entry.type : entry.type?.typeName;
+            const richType = typeof entry.type?.serialize === "function" ? entry.type : getRichTypeByFlowGraphType(typeKey);
+            entry.type = richType;
+            // Pass default value from event data schema so outputs have the correct initial value
+            this.registerDataOutput(key, richType, (entry as any).value);
+        }
+        // Reserved `event` output exposing the event reference. Guard against a
+        // (pathological) custom event value socket literally named "event".
+        this.eventRef =
+            this.config.eventData && Object.prototype.hasOwnProperty.call(this.config.eventData, "event")
+                ? this.getDataOutput("event")!
+                : this.registerDataOutput("event", RichTypeString);
+    }
+
+    public override _updateOutputs(context: FlowGraphContext): void {
+        this.eventRef.setValue(context.getEventReference(this.eventKey), context);
+    }
+
+    public override _preparePendingTasks(context: FlowGraphContext): void {
+        const observable = context.configuration.coordinator.getCustomEventObservable(this.config.eventId);
+        // check if we are not exceeding the max number of events
+        if (observable && observable.hasObservers() && observable.observers.length > FlowGraphCoordinator.MaxEventsPerType) {
+            this._reportError(context, `FlowGraphReceiveCustomEventBlock: Too many observers for event ${this.config.eventId}. Max is ${FlowGraphCoordinator.MaxEventsPerType}.`);
+            return;
+        }
+
+        const eventObserver = observable.add((eventData: { [key: string]: any }, eventState) => {
+            // Make this dispatch's EventState reachable by event/stopPropagation
+            // for the duration of the synchronous receiver flow.
+            context.configuration.coordinator._beginEventDispatch(this.eventKey, eventState);
+            try {
+                // Drive the outputs from the configured payload schema rather than from the incoming
+                // keys, so a key the sender omitted (or sent as undefined) resets to its configured
+                // default instead of retaining the value from a previous dispatch.
+                for (const key of Object.keys(this.config.eventData ?? {})) {
+                    const output = this.getDataOutput(key);
+                    if (!output) {
+                        continue;
+                    }
+                    const incoming = eventData?.[key];
+                    output.setValue(incoming === undefined ? this._getEventDataDefault(key) : incoming, context);
+                }
+                // Expose the event reference before activating downstream flow.
+                this.eventRef.setValue(context.getEventReference(this.eventKey), context);
+                this._execute(context);
+            } finally {
+                context.configuration.coordinator._endEventDispatch();
+            }
+        });
+        context._setExecutionVariable(this, "_eventObserver", eventObserver);
+    }
+
+    /**
+     * The value an output falls back to when the sender provides no value for it: the default
+     * declared by the payload schema, or the socket type's default when the schema declares none.
+     * @param key the payload key
+     * @returns the default value for that key
+     */
+    private _getEventDataDefault(key: string): any {
+        const entry =
+            this.config.eventData && Object.prototype.hasOwnProperty.call(this.config.eventData, key)
+                ? (this.config.eventData[key] as { type: RichType<any>; value?: any })
+                : undefined;
+        return entry?.value !== undefined ? entry.value : entry?.type?.defaultValue;
+    }
+    public override _cancelPendingTasks(context: FlowGraphContext): void {
+        const observable = context.configuration.coordinator.getCustomEventObservable(this.config.eventId);
+        if (observable) {
+            const eventObserver = context._getExecutionVariable<Nullable<Observer<any[]>>>(this, "_eventObserver", null);
+            observable.remove(eventObserver);
+        } else {
+            Logger.Warn(`FlowGraphReceiveCustomEventBlock: Missing observable for event ${this.config.eventId}`);
+        }
+    }
+
+    public override _executeEvent(_context: FlowGraphContext, _payload: any): boolean {
+        return true;
+    }
+
+    public override serialize(serializationObject: any = {}) {
+        super.serialize(serializationObject);
+        // Override the eventData in config to store typeName strings instead of RichType instances
+        const serializedEventData: any = Object.create(null);
+        for (const key of Object.keys(this.config.eventData ?? {})) {
+            const entry = this.config.eventData[key];
+            const serializedEntry: { type: string; value?: unknown } = { type: entry.type.typeName };
+            if (entry.value !== undefined) {
+                defaultValueSerializationFunction("value", entry.value, serializedEntry);
+            }
+            Object.defineProperty(serializedEventData, key, {
+                configurable: true,
+                enumerable: true,
+                value: serializedEntry,
+                writable: true,
+            });
+        }
+        serializationObject.config.eventData = serializedEventData;
+    }
+
+    /**
+     * @returns class name of the block.
+     */
+    public override getClassName(): string {
+        return FlowGraphBlockNames.ReceiveCustomEvent;
+    }
+}
+
+let _Registered = false;
+/**
+ * Register side effects for flowGraphReceiveCustomEventBlock.
+ * Safe to call multiple times; only the first call has an effect.
+ */
+export function RegisterFlowGraphReceiveCustomEventBlock(): void {
+    if (_Registered) {
+        return;
+    }
+    _Registered = true;
+
+    RegisterClass(FlowGraphBlockNames.ReceiveCustomEvent, FlowGraphReceiveCustomEventBlock);
+}

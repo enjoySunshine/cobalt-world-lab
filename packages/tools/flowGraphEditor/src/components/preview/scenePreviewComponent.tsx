@@ -1,0 +1,1581 @@
+import * as React from "react";
+import { type GlobalState } from "../../globalState";
+import { type Nullable } from "core/types";
+import { type Observer } from "core/Misc/observable";
+import { type Scene } from "core/scene";
+import { type AbstractMesh } from "core/Meshes/abstractMesh";
+import "core/Helpers/sceneHelpers";
+import { type Engine } from "core/Engines/engine";
+import { type IKHRInteractivityImportResult } from "loaders/glTF/2.0/Extensions/KHR_interactivity.pure";
+import { SceneContext } from "../../sceneContext";
+import { SerializationTools, type IFlowGraphEditorDeserializedState } from "../../serializationTools";
+import { LogEntry } from "../log/logComponent";
+import { ShowToast } from "../toast/toastComponent";
+import { LoadSnippet, type IPlaygroundSnippetResult } from "@tools/snippet-loader";
+import { CaptureFlowGraphSnippetId } from "./flowGraphSnippetCapture";
+import {
+    Body1,
+    Button,
+    Dialog,
+    DialogActions,
+    DialogBody,
+    DialogContent,
+    DialogSurface,
+    DialogTitle,
+    Dropdown,
+    Input,
+    Label,
+    Option,
+    Tooltip,
+    makeStyles,
+    tokens,
+} from "@fluentui/react-components";
+import { CheckmarkRegular } from "@fluentui/react-icons";
+import { ComputeFlowGraphLayout, type IFlowLayoutNode } from "../../graphSystem/flowGraphLayout";
+import { type ISerializedFlowGraphBlock } from "core/FlowGraph/typeDefinitions";
+import { IsFlowGraphEventBlockName } from "../../graphSystem/blockTypeColors";
+import { GetFlowGraphBlockNodeId } from "../../graphSystem/blockNodeData";
+import { CreateKhrSelectionRevealTemplate } from "../../khrSelectionRevealTemplate";
+import { TrackKhrNodeStateMutations } from "../../khrSceneReset";
+import { GetGlbExternalResourceUris, GetGlbNodeIndex, PatchKhrSelectionRevealGlb, PatchKhrTwoStepProcedureGlb, ReadGlbDocument } from "../../khrGlbBehaviorAuthoring";
+import { CreateKhrTwoStepProcedureTemplate, ValidateKhrTwoStepProcedureMeshes, type IKhrTwoStepProcedureNodes } from "../../khrTwoStepProcedureTemplate";
+
+interface IScenePreviewComponentProps {
+    globalState: GlobalState;
+}
+
+interface IScenePreviewComponentInnerProps extends IScenePreviewComponentProps {
+    classes: ReturnType<typeof useStyles>;
+}
+
+interface IScenePreviewComponentState {
+    snippetId: string;
+    isLoading: boolean;
+    error: string;
+    sceneObjectCount: number;
+    triggerMeshId: string;
+    revealMeshId: string;
+    behaviorKind: "reveal" | "procedure";
+    procedureMeshIds: IKhrTwoStepProcedureNodes<string>;
+    showAuthoringDialog: boolean;
+}
+
+interface IStagedKhrInteractivityImport {
+    state: IFlowGraphEditorDeserializedState;
+    importResult: IKHRInteractivityImportResult;
+}
+
+const ImportedBlockWidth = 240;
+// GraphFrame renders collapsed groups at 200 px even when their stored expanded width is larger.
+const ImportedCollapsedFrameWidth = 200;
+const ImportedBlockBaseHeight = 76;
+const ImportedPortHeight = 26;
+const ImportedCompositeGap = 24;
+
+function _GetImportedBlockHeight(block: ISerializedFlowGraphBlock): number {
+    const inputCount = block.signalInputs.length + block.dataInputs.length;
+    const outputCount = block.signalOutputs.length + block.dataOutputs.length;
+    return ImportedBlockBaseHeight + Math.max(inputCount, outputCount) * ImportedPortHeight;
+}
+
+function _CreateKhrInteractivityEditorData(blocks: ISerializedFlowGraphBlock[], graphName: string) {
+    const groupKeys = blocks.map((block, index) => {
+        const sourceNodeIndex = block.metadata?.khrInteractivity?.nodeIndex;
+        return typeof sourceNodeIndex === "number" ? `source:${sourceNodeIndex}` : `block:${index}`;
+    });
+    const groups = new Map<string, { blocks: ISerializedFlowGraphBlock[]; blockIndices: number[] }>();
+    for (let index = 0; index < blocks.length; index++) {
+        const key = groupKeys[index];
+        const group = groups.get(key) ?? { blocks: [], blockIndices: [] };
+        group.blocks.push(blocks[index]);
+        group.blockIndices.push(index);
+        groups.set(key, group);
+    }
+
+    const groupEntries = [...groups.entries()];
+    const isSelectionRevealTemplate =
+        graphName === "Select to reveal" &&
+        groupEntries.length === 2 &&
+        groupEntries.some(([, group]) => group.blocks[0].metadata.khrInteractivity?.operation.startsWith("event/onSelect")) &&
+        groupEntries.some(([, group]) => group.blocks[0].metadata.khrInteractivity?.operation === "pointer/set");
+    const groupIndexByKey = new Map(groupEntries.map(([key], index) => [key, index]));
+    const inputOwner = new Map<string, number>();
+    const outputOwner = new Map<string, number>();
+    for (let blockIndex = 0; blockIndex < blocks.length; blockIndex++) {
+        const groupIndex = groupIndexByKey.get(groupKeys[blockIndex])!;
+        for (const input of [...blocks[blockIndex].signalInputs, ...blocks[blockIndex].dataInputs]) {
+            inputOwner.set(input.uniqueId, groupIndex);
+        }
+        for (const output of [...blocks[blockIndex].signalOutputs, ...blocks[blockIndex].dataOutputs]) {
+            outputOwner.set(output.uniqueId, groupIndex);
+        }
+    }
+
+    const layoutNodes: IFlowLayoutNode[] = groupEntries.map(([, group], groupIndex) => {
+        const signalOut = new Set<number>();
+        const dataOut = new Set<number>();
+        let externalInputCount = 0;
+        let externalOutputCount = 0;
+        for (const block of group.blocks) {
+            for (const input of [...block.signalInputs, ...block.dataInputs]) {
+                if (input.connectedPointIds.some((endpoint) => outputOwner.get(endpoint) !== groupIndex)) {
+                    externalInputCount++;
+                }
+            }
+            for (const output of block.signalOutputs) {
+                let hasExternalTarget = false;
+                for (const endpoint of output.connectedPointIds) {
+                    const target = inputOwner.get(endpoint);
+                    if (target !== undefined && target !== groupIndex) {
+                        signalOut.add(target);
+                        hasExternalTarget = true;
+                    }
+                }
+                externalOutputCount += hasExternalTarget ? 1 : 0;
+            }
+            for (const output of block.dataOutputs) {
+                let hasExternalTarget = false;
+                for (const endpoint of output.connectedPointIds) {
+                    const target = inputOwner.get(endpoint);
+                    if (target !== undefined && target !== groupIndex) {
+                        dataOut.add(target);
+                        hasExternalTarget = true;
+                    }
+                }
+                externalOutputCount += hasExternalTarget ? 1 : 0;
+            }
+        }
+        const collapsedHeight = ImportedBlockBaseHeight + Math.max(externalInputCount, externalOutputCount) * ImportedPortHeight;
+        return {
+            id: groupIndex,
+            width: group.blocks.length > 1 ? ImportedCollapsedFrameWidth : ImportedBlockWidth,
+            height: group.blocks.length > 1 ? collapsedHeight : Math.max(...group.blocks.map(_GetImportedBlockHeight)),
+            isEvent: group.blocks.some((block) => IsFlowGraphEventBlockName(block.className)),
+            signalOut: [...signalOut],
+            dataOut: [...dataOut],
+        };
+    });
+    const positions = ComputeFlowGraphLayout(layoutNodes, isSelectionRevealTemplate ? { startX: 40, startY: 40 } : undefined);
+    const locations: { blockId: string; x: number; y: number; isCollapsed: boolean }[] = [];
+    const frames: any[] = [];
+    for (let groupIndex = 0; groupIndex < groupEntries.length; groupIndex++) {
+        const [, group] = groupEntries[groupIndex];
+        const position = positions.get(groupIndex)!;
+        let blockX = position.x;
+        for (const block of group.blocks) {
+            locations.push({ blockId: block.uniqueId, x: blockX, y: position.y, isCollapsed: false });
+            blockX += ImportedBlockWidth + ImportedCompositeGap;
+        }
+        if (group.blocks.length > 1) {
+            const provenance = group.blocks[0].metadata.khrInteractivity;
+            const expandedWidth = group.blocks.length * ImportedBlockWidth + (group.blocks.length - 1) * ImportedCompositeGap;
+            const templateFrameName = provenance.operation.startsWith("event/onSelect") ? "Select part" : "Reveal part";
+            frames.push({
+                x: position.x - ImportedCompositeGap,
+                y: position.y - 36,
+                width: expandedWidth + ImportedCompositeGap * 2,
+                height: Math.max(...group.blocks.map(_GetImportedBlockHeight)) + 60,
+                color: [0.46, 0.32, 0.65],
+                name: isSelectionRevealTemplate ? templateFrameName : `${provenance.operation} · glTF node ${provenance.nodeIndex}`,
+                isCollapsed: true,
+                blocks: group.blocks.map((block) => block.uniqueId),
+                comments: isSelectionRevealTemplate ? "" : provenance.sourcePath,
+            });
+        }
+    }
+    const map = Object.fromEntries(blocks.map((block) => [block.uniqueId, GetFlowGraphBlockNodeId(block.uniqueId)]));
+    return { locations, frames, x: 0, y: 0, zoom: 1, map, zoomToFitOnLoad: true };
+}
+
+const useStyles = makeStyles({
+    container: {
+        display: "grid",
+        gridTemplateRows: "auto 1fr auto",
+        height: "100%",
+        width: "100%",
+        overflow: "hidden",
+        background: tokens.colorNeutralBackground3,
+        color: tokens.colorNeutralForeground1,
+        fontSize: tokens.fontSizeBase200,
+    },
+    loader: { background: tokens.colorNeutralBackground2 },
+    inputRow: {
+        display: "grid",
+        gridTemplateColumns: "minmax(0, 1fr) auto auto",
+        gap: tokens.spacingHorizontalXS,
+        padding: `${tokens.spacingVerticalXS} ${tokens.spacingHorizontalS} ${tokens.spacingVerticalSNudge}`,
+    },
+    fillInput: { width: "100%" },
+    error: {
+        color: tokens.colorPaletteRedForeground1,
+        padding: `${tokens.spacingVerticalXXS} ${tokens.spacingHorizontalS} ${tokens.spacingVerticalSNudge}`,
+        fontSize: tokens.fontSizeBase300,
+    },
+    status: {
+        padding: `${tokens.spacingVerticalXXS} ${tokens.spacingHorizontalS} ${tokens.spacingVerticalSNudge}`,
+        fontSize: tokens.fontSizeBase300,
+        color: tokens.colorNeutralForeground2,
+    },
+    statusCount: {
+        color: tokens.colorPaletteGreenForeground1,
+        fontWeight: tokens.fontWeightBold,
+    },
+    statusWired: {
+        display: "inline-flex",
+        alignItems: "center",
+        gap: tokens.spacingHorizontalXXS,
+        marginLeft: tokens.spacingHorizontalS,
+        color: tokens.colorPaletteGreenForeground1,
+        fontSize: tokens.fontSizeBase300,
+    },
+    authoring: {
+        display: "grid",
+        gap: tokens.spacingVerticalS,
+    },
+    authoringSelect: { minWidth: 0, width: "100%" },
+    authoringDialog: { width: "min(420px, calc(100vw - 32px))", maxHeight: "calc(100dvh - 32px)", overflowY: "auto" },
+    canvasContainer: {
+        position: "relative",
+        overflow: "hidden",
+        borderTop: `1px solid ${tokens.colorNeutralStroke2}`,
+    },
+    canvasHost: {
+        width: "100%",
+        height: "100%",
+    },
+    canvas: {
+        display: "block",
+        width: "100%",
+        height: "100%",
+        outline: "none",
+        padding: 0,
+    },
+    summary: {
+        background: tokens.colorNeutralBackground2,
+        borderTop: `1px solid ${tokens.colorNeutralStroke2}`,
+        padding: `${tokens.spacingVerticalXS} 0`,
+        overflowY: "auto",
+        maxHeight: "120px",
+    },
+    categoryItem: {
+        display: "grid",
+        gridTemplateColumns: "1fr auto",
+        padding: `${tokens.spacingVerticalXXS} ${tokens.spacingHorizontalM}`,
+        fontSize: tokens.fontSizeBase300,
+        ":hover": { background: tokens.colorNeutralBackground1Hover },
+    },
+    categoryLabel: { color: tokens.colorNeutralForeground2 },
+    categoryCount: {
+        color: tokens.colorPaletteGreenForeground1,
+        fontWeight: tokens.fontWeightBold,
+    },
+});
+
+/**
+ * Component that provides a Playground snippet loader and a live scene preview.
+ * Wraps the stateful inner class so we can use `makeStyles` (a hook).
+ * @param props - The component props.
+ * @returns The rendered scene preview.
+ */
+export const ScenePreviewComponent: React.FunctionComponent<IScenePreviewComponentProps> = (props) => {
+    const classes = useStyles();
+    return <ScenePreviewInner {...props} classes={classes} />;
+};
+
+class ScenePreviewInner extends React.Component<IScenePreviewComponentInnerProps, IScenePreviewComponentState> {
+    private _canvasHostRef: React.RefObject<HTMLDivElement>;
+    private _onContextRefreshedObserver: Nullable<Observer<SceneContext>> = null;
+    private _onSceneContextChangedObserver: Nullable<Observer<SceneContext>> = null;
+    private _onSnippetIdChangedObserver: Nullable<Observer<string>> = null;
+    private _onReloadSnippetRequestedObserver: Nullable<Observer<void>> = null;
+    private _onDropEventObserver: Nullable<Observer<DragEvent>> = null;
+    private _watchedSceneContext: Nullable<SceneContext> = null;
+    private _resizeScene: Nullable<Scene> = null;
+    private _resizeWindow: Nullable<Window> = null;
+    private _resizeObserver: Nullable<ResizeObserver> = null;
+    private _resizeHandler: Nullable<() => void> = null;
+
+    private _blockImportScopedSceneReplacement(): boolean {
+        if (!this.props.globalState.hasImportScopedRuntime) {
+            return false;
+        }
+        const message = "Replace the KHR_interactivity file instead of changing its preview scene; the active graph runtime and references belong to the imported asset.";
+        this.props.globalState.onLogRequiredObservable.notifyObservers(new LogEntry(message, true));
+        this.setState({ error: message });
+        return true;
+    }
+
+    /** @internal */
+    constructor(props: IScenePreviewComponentInnerProps) {
+        super(props);
+        this._canvasHostRef = React.createRef();
+
+        this.state = {
+            snippetId: props.globalState.snippetId,
+            isLoading: false,
+            error: "",
+            sceneObjectCount: props.globalState.sceneContext?.entries.length ?? 0,
+            triggerMeshId: "",
+            revealMeshId: "",
+            behaviorKind: "reveal",
+            procedureMeshIds: { first: "", second: "", nextCue: "", completionCue: "", reset: "" },
+            showAuthoringDialog: false,
+        };
+    }
+
+    /** @internal */
+    override componentDidMount() {
+        const renderLoopNeedsRestart = this._attachPreviewCanvas();
+
+        // Watch for external context changes
+        if (this.props.globalState.sceneContext) {
+            this._watchContext(this.props.globalState.sceneContext);
+        }
+        this._onSceneContextChangedObserver = this.props.globalState.onSceneContextChanged.add((ctx) => {
+            if (ctx) {
+                this._watchContext(ctx);
+                this.setState({
+                    sceneObjectCount: ctx.entries.length,
+                    triggerMeshId: "",
+                    revealMeshId: "",
+                    behaviorKind: "reveal",
+                    procedureMeshIds: { first: "", second: "", nextCue: "", completionCue: "", reset: "" },
+                    showAuthoringDialog: false,
+                });
+            }
+        });
+
+        // When a graph is loaded from JSON with a stored snippet ID, auto-load the scene
+        this._onSnippetIdChangedObserver = this.props.globalState.onSnippetIdChanged.add((snippetId) => {
+            if (snippetId) {
+                this.setState({ snippetId }, () => {
+                    void this.loadSnippetAsync();
+                });
+            }
+        });
+
+        // When a reload is requested (e.g. from the Reset button), re-run the current snippet
+        this._onReloadSnippetRequestedObserver = this.props.globalState.onReloadSnippetRequested.add(() => {
+            const sceneSource = this.props.globalState.sceneSource;
+            if (sceneSource === "host") {
+                this._attachToHostScene();
+            } else if ((sceneSource === "snippet" || (!sceneSource && this.state.snippetId)) && this.state.snippetId) {
+                void this.loadSnippetAsync();
+            } else if (sceneSource === "default" || (!sceneSource && !this.state.snippetId)) {
+                void this._createDefaultSceneAsync();
+            }
+        });
+
+        // Listen for scene-file drops forwarded from the root editor (editor-wide drag-and-drop)
+        this._onDropEventObserver = this.props.globalState.onDropEventReceivedObservable.add((e) => {
+            this._handleDrop(e);
+        });
+
+        // Reconcile the existing scene with the mounted pane. The canvas is retained and reparented
+        // across pane mounts because a WebGL context cannot be transferred to a replacement canvas.
+        const ctx = this.props.globalState.sceneContext;
+        const pendingSnippetId = this.props.globalState.snippetId;
+        const hasHostScene = !!this.props.globalState.hostScene;
+        const isHostCtx = !!ctx && !ctx.ownsScene;
+        if (ctx?.ownsScene) {
+            if (renderLoopNeedsRestart) {
+                this._setupEngineRenderLoop(ctx.scene, ctx.engine);
+            } else {
+                this._bindCanvasResize(ctx.scene, ctx.engine);
+            }
+        }
+        if (isHostCtx) {
+            // Popup pane re-mounted while attached to a still-live host scene — rewire the context
+            // (and its observers) against that scene rather than tearing it down.
+            this._attachToHostScene();
+        } else if (!ctx && !pendingSnippetId) {
+            // First mount with no prior state — attach to the host scene when one was supplied,
+            // otherwise create a default scene so the editor is usable without a snippet.
+            if (hasHostScene) {
+                this._attachToHostScene();
+            } else {
+                void this._createDefaultSceneAsync();
+            }
+        }
+    }
+
+    private _attachPreviewCanvas(): boolean {
+        const host = this._canvasHostRef.current;
+        if (!host) {
+            throw new Error("Preview canvas host not available");
+        }
+        const sceneContext = this.props.globalState.sceneContext;
+        const sceneCanvas = sceneContext?.ownsScene ? sceneContext.engine.getRenderingCanvas() : null;
+        const canvas = sceneCanvas ?? this.props.globalState.scenePreviewCanvas ?? host.ownerDocument.createElement("canvas");
+        const movedAcrossDocuments = canvas.ownerDocument !== host.ownerDocument;
+        if (movedAcrossDocuments && sceneContext?.ownsScene) {
+            sceneContext.engine.stopRenderLoop();
+        }
+        canvas.className = this.props.classes.canvas;
+        canvas.tabIndex = 0;
+        canvas.dataset.testid = "scene-preview-canvas";
+        host.replaceChildren(canvas);
+        this.props.globalState.scenePreviewCanvas = canvas;
+        return movedAcrossDocuments;
+    }
+
+    /** @internal */
+    override componentWillUnmount() {
+        this._unbindCanvasResize();
+        this._unwatchContext();
+        this._onSceneContextChangedObserver?.remove();
+        this._onSnippetIdChangedObserver?.remove();
+        this._onReloadSnippetRequestedObserver?.remove();
+        this._onDropEventObserver?.remove();
+    }
+
+    private _watchContext(ctx: SceneContext) {
+        this._unwatchContext();
+        this._onContextRefreshedObserver = ctx.onContextRefreshed.add(() => {
+            this.setState({ sceneObjectCount: ctx.entries.length });
+        });
+        this._watchedSceneContext = ctx;
+    }
+
+    private _unwatchContext() {
+        if (this._onContextRefreshedObserver && this._watchedSceneContext) {
+            this._watchedSceneContext.onContextRefreshed.remove(this._onContextRefreshedObserver);
+            this._onContextRefreshedObserver = null;
+        }
+        this._watchedSceneContext = null;
+    }
+
+    /**
+     * Dispose the previous preview engine/scene/context so a new one can be created.
+     * Also clears the sceneContext reference on globalState to avoid stale pointers.
+     */
+    private _disposeCurrentScene() {
+        const oldCtx = this.props.globalState.sceneContext;
+        if (oldCtx) {
+            this._disposeSceneContext(oldCtx);
+        }
+    }
+
+    private _disposeSceneContext(sceneContext: SceneContext): void {
+        if (sceneContext.ownsScene) {
+            if (this._resizeScene === sceneContext.scene) {
+                this._unbindCanvasResize();
+            }
+            sceneContext.engine.stopRenderLoop();
+            sceneContext.scene.dispose();
+            sceneContext.engine.dispose();
+        }
+        sceneContext.dispose();
+        if (this.props.globalState.sceneContext === sceneContext) {
+            this.props.globalState.sceneContext = null;
+            this.props.globalState.sceneSource = null;
+            this.props.globalState.sourceGlb = null;
+            this.props.globalState.sourceGltf = null;
+        }
+    }
+
+    /**
+     * Start the render loop on the given engine and wire up resize handling.
+     * @param scene - the Babylon.js scene to render
+     * @param engine - the engine to run the render loop on
+     */
+    private _setupEngineRenderLoop(scene: Scene, engine: { runRenderLoop: Engine["runRenderLoop"]; resize: Engine["resize"] }) {
+        engine.runRenderLoop(() => {
+            if (scene.activeCamera || (scene.activeCameras && scene.activeCameras.length > 0)) {
+                scene.render();
+            }
+        });
+
+        this._bindCanvasResize(scene, engine);
+    }
+
+    private _bindCanvasResize(scene: Scene, engine: { resize: Engine["resize"] }): void {
+        this._unbindCanvasResize();
+        const canvas = this.props.globalState.scenePreviewCanvas;
+        const ownerWindow = canvas?.ownerDocument.defaultView ?? null;
+        const resizeHandler = () => {
+            engine.resize();
+            if (scene.activeCamera || (scene.activeCameras && scene.activeCameras.length > 0)) {
+                scene.render();
+            }
+        };
+        resizeHandler();
+        ownerWindow?.addEventListener("resize", resizeHandler);
+
+        if (canvas?.parentElement) {
+            const resizeObserverConstructor = ownerWindow?.ResizeObserver ?? ResizeObserver;
+            this._resizeObserver = new resizeObserverConstructor(resizeHandler);
+            this._resizeObserver.observe(canvas.parentElement);
+        }
+        this._resizeScene = scene;
+        this._resizeWindow = ownerWindow;
+        this._resizeHandler = resizeHandler;
+    }
+
+    private _unbindCanvasResize(): void {
+        if (this._resizeHandler) {
+            this._resizeWindow?.removeEventListener("resize", this._resizeHandler);
+        }
+        this._resizeObserver?.disconnect();
+        this._resizeScene = null;
+        this._resizeWindow = null;
+        this._resizeObserver = null;
+        this._resizeHandler = null;
+    }
+
+    /**
+     * Build a SceneContext and publish it to the editor.
+     * @param scene - the scene to wrap in a SceneContext
+     * @param source - the source used to create the preview scene
+     * @param ownsScene - whether the editor owns the scene/engine lifecycle (false for a live host scene)
+     * @returns the newly created SceneContext
+     */
+    private _publishSceneContext(scene: Scene, source: "default" | "snippet" | "file" | "host", ownsScene: boolean = true) {
+        const sceneContext = new SceneContext(scene, ownsScene);
+        this.props.globalState.sceneContext = sceneContext;
+        this.props.globalState.sceneSource = source;
+        this.props.globalState.sourceGlb = null;
+        this.props.globalState.sourceGltf = null;
+        this.props.globalState.onSceneContextChanged.notifyObservers(sceneContext);
+        this.setState({ sceneObjectCount: sceneContext.entries.length });
+        return sceneContext;
+    }
+
+    /**
+     * Attach the preview to the live host scene supplied to the editor (e.g. when launched from
+     * the Inspector against a running application). The host scene is catalogued and wired to the
+     * flow graph, but its engine/canvas belong to the application, so the preview does not create
+     * an engine or render loop and never disposes the scene.
+     * @returns true when a host scene was present and attached
+     */
+    private _attachToHostScene(): boolean {
+        if (this._blockImportScopedSceneReplacement()) {
+            return false;
+        }
+        const hostScene = this.props.globalState.hostScene;
+        if (!hostScene) {
+            return false;
+        }
+        this._disposeCurrentScene();
+        const sceneContext = this._publishSceneContext(hostScene, "host", false);
+        this.props.globalState.snippetId = "";
+        this.setState({ snippetId: "" });
+        this.props.globalState.onLogRequiredObservable.notifyObservers(
+            new LogEntry(`Connected to the live application scene (${sceneContext.entries.length} objects). The graph runs against this scene directly.`, false)
+        );
+        return true;
+    }
+
+    /**
+     * Create a minimal default scene so users can start building flow graphs immediately.
+     */
+    private async _createDefaultSceneAsync() {
+        if (this._blockImportScopedSceneReplacement()) {
+            return;
+        }
+        const canvas = this.props.globalState.scenePreviewCanvas;
+        if (!canvas) {
+            return;
+        }
+
+        try {
+            // Dynamic imports resolved to the BABYLON global by the UMD dev server
+            const { Engine } = await import("core/Engines/engine");
+            const { Scene } = await import("core/scene");
+            const { ArcRotateCamera } = await import("core/Cameras/arcRotateCamera");
+            const { HemisphericLight } = await import("core/Lights/hemisphericLight");
+            const { Vector3 } = await import("core/Maths/math.vector");
+            const { Color3 } = await import("core/Maths/math.color");
+            const { CreateBox } = await import("core/Meshes/Builders/boxBuilder");
+            const { CreateSphere } = await import("core/Meshes/Builders/sphereBuilder");
+            const { CreateGround } = await import("core/Meshes/Builders/groundBuilder");
+            const { CreateCylinder } = await import("core/Meshes/Builders/cylinderBuilder");
+            const { StandardMaterial } = await import("core/Materials/standardMaterial");
+
+            if (this._blockImportScopedSceneReplacement()) {
+                return;
+            }
+            this._disposeCurrentScene();
+
+            const engine = new Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true });
+            const scene = new Scene(engine);
+
+            // Camera
+            const camera = new ArcRotateCamera("camera", -Math.PI / 4, Math.PI / 3, 10, Vector3.Zero(), scene);
+            camera.attachControl(canvas, true);
+            camera.lowerRadiusLimit = 2;
+
+            // Light
+            const light = new HemisphericLight("light", new Vector3(0, 1, 0), scene);
+            light.intensity = 0.8;
+
+            // Ground
+            const ground = CreateGround("ground", { width: 8, height: 8 }, scene);
+            const groundMat = new StandardMaterial("groundMat", scene);
+            groundMat.diffuseColor = new Color3(0.3, 0.3, 0.3);
+            groundMat.specularColor = new Color3(0, 0, 0);
+            ground.material = groundMat;
+            ground.receiveShadows = true;
+
+            // Box
+            const box = CreateBox("box", { size: 1 }, scene);
+            box.position = new Vector3(-1.5, 0.5, 0);
+            const boxMat = new StandardMaterial("boxMat", scene);
+            boxMat.diffuseColor = new Color3(0.2, 0.5, 0.8);
+            box.material = boxMat;
+
+            // Sphere
+            const sphere = CreateSphere("sphere", { diameter: 1, segments: 16 }, scene);
+            sphere.position = new Vector3(0, 0.5, 0);
+            const sphereMat = new StandardMaterial("sphereMat", scene);
+            sphereMat.diffuseColor = new Color3(0.8, 0.3, 0.2);
+            sphere.material = sphereMat;
+
+            // Cylinder
+            const cylinder = CreateCylinder("cylinder", { diameter: 0.8, height: 1 }, scene);
+            cylinder.position = new Vector3(1.5, 0.5, 0);
+            const cylMat = new StandardMaterial("cylinderMat", scene);
+            cylMat.diffuseColor = new Color3(0.3, 0.7, 0.3);
+            cylinder.material = cylMat;
+
+            this._setupEngineRenderLoop(scene, engine);
+
+            const sceneContext = this._publishSceneContext(scene, "default");
+            this.props.globalState.snippetId = "";
+            this.setState({ snippetId: "" });
+            this.props.globalState.onLogRequiredObservable.notifyObservers(
+                new LogEntry(
+                    `Default scene created with ${sceneContext.entries.length} objects. Drop a .glb/.gltf/.babylon file or load a Playground snippet to replace it.`,
+                    false
+                )
+            );
+        } catch (err: any) {
+            this.props.globalState.onLogRequiredObservable.notifyObservers(new LogEntry(`Failed to create default scene: ${err.message}`, true));
+        }
+    }
+
+    private async _stageFlowGraphsFromSceneAsync(scene: Scene): Promise<Nullable<IStagedKhrInteractivityImport>> {
+        const getImportResult = (globalThis as any).BABYLON?.GLTF2?.Loader?.Extensions?.GetKHRInteractivityImportResult as
+            ((scene: Scene) => IKHRInteractivityImportResult | undefined) | undefined;
+        const getImportResults = (globalThis as any).BABYLON?.GLTF2?.Loader?.Extensions?.GetKHRInteractivityImportResults as
+            ((scene: Scene) => readonly IKHRInteractivityImportResult[]) | undefined;
+        const importResults = getImportResults?.(scene);
+        const importResult = importResults?.[importResults.length - 1] ?? getImportResult?.(scene);
+        if (!importResult) {
+            return null;
+        }
+        TrackKhrNodeStateMutations(importResult);
+
+        const serializedGraphs = importResult.graphs.map((graphResult) => {
+            const serializedFlowGraph = graphResult.serializedFlowGraph ?? {
+                name: graphResult.graph.name,
+                rightHanded: true,
+                allBlocks: [],
+                executionContexts: [],
+            };
+            (serializedFlowGraph as any).editorData = _CreateKhrInteractivityEditorData(serializedFlowGraph.allBlocks, serializedFlowGraph.name ?? "");
+            return serializedFlowGraph;
+        });
+        const requestedGraphIndex = importResult.document.defaultGraphIndex;
+        const activeGraphIndex =
+            requestedGraphIndex >= 0 && importResult.graphs[requestedGraphIndex]?.serializedFlowGraph
+                ? requestedGraphIndex
+                : Math.max(
+                      0,
+                      importResult.graphs.findIndex((graphResult) => !!graphResult.serializedFlowGraph)
+                  );
+        const state = await SerializationTools.DeserializeToStateAsync(
+            {
+                _flowGraphs: serializedGraphs,
+                activeGraphIndex,
+            },
+            scene,
+            importResult.pathConverter,
+            {
+                coordinatorConfig: { hostResolver: importResult.hostResolver },
+                dispatchEventsSynchronously: false,
+                sourceFormat: "KHR_interactivity",
+            }
+        );
+        return { state, importResult };
+    }
+
+    private _logKhrInteractivityImport(importResult: IKHRInteractivityImportResult, fileName: string): void {
+        this.props.globalState.stateManager.onSelectionChangedObservable.notifyObservers(null);
+        this.props.globalState.onClearUndoStack.notifyObservers();
+        this.props.globalState.onLogRequiredObservable.notifyObservers(
+            new LogEntry("KHR_interactivity graphs use import-scoped runtime services; JSON save and reload are unavailable for this import.", false)
+        );
+        for (const diagnostic of importResult.document.diagnostics) {
+            this.props.globalState.onLogRequiredObservable.notifyObservers(
+                new LogEntry(`KHR_interactivity ${diagnostic.severity}: ${diagnostic.path}: ${diagnostic.message}`, diagnostic.severity === "error")
+            );
+        }
+        let compatibilityDiagnosticCount = 0;
+        for (const graphResult of importResult.graphs) {
+            if (graphResult.serializedFlowGraph) {
+                compatibilityDiagnosticCount += graphResult.diagnostics.length;
+                continue;
+            }
+            for (const diagnostic of graphResult.diagnostics) {
+                this.props.globalState.onLogRequiredObservable.notifyObservers(
+                    new LogEntry(`KHR_interactivity ${diagnostic.severity}: ${diagnostic.path}: ${diagnostic.message}`, diagnostic.severity === "error")
+                );
+            }
+        }
+        if (compatibilityDiagnosticCount > 0) {
+            this.props.globalState.onLogRequiredObservable.notifyObservers(
+                new LogEntry(
+                    `KHR_interactivity compatibility mode ignored ${compatibilityDiagnosticCount} non-blocking source conformance issue(s) while importing executable graphs.`,
+                    false
+                )
+            );
+        }
+        const executableGraphCount = importResult.graphs.filter((graph) => graph.serializedFlowGraph).length;
+        this.props.globalState.onLogRequiredObservable.notifyObservers(
+            new LogEntry(`Imported ${importResult.graphs.length} KHR_interactivity graph(s) from "${fileName}" (${executableGraphCount} executable)`, false)
+        );
+    }
+
+    /**
+     * Load a scene from a dropped file (glb, gltf, or babylon).
+     * @param file - the main scene file
+     * @param companionFiles - additional files dropped alongside (bin, textures)
+     * @param preparedByEditor allows the editor's template preparation to hand off a pending load
+     * @param authoredBehavior whether this file was patched by the source-preserving authoring action
+     * @returns whether the file loaded successfully
+     */
+    private async _loadFileAsync(file: File, companionFiles?: File[], preparedByEditor = false, authoredBehavior = false): Promise<boolean> {
+        if (this.state.isLoading && !preparedByEditor) {
+            return false; // Prevent concurrent loads
+        }
+        this.setState({ isLoading: true, error: "", showAuthoringDialog: false });
+
+        const registeredFiles: string[] = [];
+        let stagedEngine: Engine | null = null;
+        let stagedScene: Scene | null = null;
+        let stagedSceneContext: SceneContext | null = null;
+        let stagedGraphState: IFlowGraphEditorDeserializedState | null = null;
+        try {
+            const { Engine: engineConstructor } = await import("core/Engines/engine");
+            const { LoadSceneAsync } = await import("core/Loading/sceneLoader");
+            const { FilesInputStore } = await import("core/Misc/filesInputStore");
+
+            const previousCanvas = this.props.globalState.scenePreviewCanvas;
+            if (!previousCanvas) {
+                throw new Error("Preview canvas not available");
+            }
+
+            // Concurrent engines on one canvas share a WebGL context; disposing the old engine
+            // would invalidate the staged scene's GPU resources.
+            const canvas = previousCanvas.ownerDocument.createElement("canvas");
+            canvas.width = previousCanvas.width;
+            canvas.height = previousCanvas.height;
+            const engine = new engineConstructor(canvas, true, { preserveDrawingBuffer: true, stencil: true });
+            stagedEngine = engine;
+
+            // Register the main file and any companion files in Babylon's virtual file system
+            const mainKey = file.name.toLowerCase();
+            FilesInputStore.FilesToLoad[mainKey] = file;
+            registeredFiles.push(mainKey);
+            if (companionFiles) {
+                for (const companion of companionFiles) {
+                    const key = companion.name.toLowerCase();
+                    FilesInputStore.FilesToLoad[key] = companion;
+                    registeredFiles.push(key);
+                }
+            }
+
+            const scene = await LoadSceneAsync(file.name, engine, {
+                rootUrl: "file:",
+                pluginOptions: {
+                    gltf: {
+                        extensionOptions: {
+                            ["KHR_interactivity"]: {
+                                autoStart: false,
+                                parseOnly: true,
+                                // The editor must preserve and inspect pre-ratification graphs even
+                                // when production strict validation reports conformance errors.
+                                strictValidation: false,
+                            },
+                        },
+                    },
+                },
+            });
+            stagedScene = scene;
+
+            if (!scene || !scene.render) {
+                throw new Error("Failed to load scene from file");
+            }
+
+            scene.activeCamera ??= scene.cameras[0] ?? null;
+            scene.createDefaultCamera(true, false, true);
+            scene.activeCamera?.attachControl(canvas, true);
+            // Add a default light if the scene has none
+            if (scene.lights.length === 0) {
+                scene.createDefaultLight(true);
+            }
+
+            await scene.whenReadyAsync(true);
+
+            // Detect flow graphs from the loaded file:
+            // 1. KHR_interactivity (processed by the glTF loader into coordinators)
+            // 2. BABYLON_flow_graph custom extension (our round-trip format)
+            const stagedKhrImport = await this._stageFlowGraphsFromSceneAsync(scene);
+            let importedCustomGraph = false;
+            if (stagedKhrImport) {
+                stagedGraphState = stagedKhrImport.state;
+            } else {
+                const serializedCustomGraph = await SerializationTools.ReadFlowGraphFromGlbAsync(file);
+                if (serializedCustomGraph) {
+                    stagedGraphState = await SerializationTools.DeserializeToStateAsync(serializedCustomGraph, scene);
+                    importedCustomGraph = true;
+                }
+            }
+
+            const previousSceneContext = this.props.globalState.sceneContext;
+            const retainedCoordinator = this.props.globalState.coordinator;
+            stagedSceneContext = new SceneContext(scene, true);
+            if (!stagedGraphState) {
+                const isBorrowedLiveHostGraph =
+                    !!this.props.globalState.hostScene &&
+                    previousSceneContext?.scene === this.props.globalState.hostScene &&
+                    (!retainedCoordinator || !this.props.globalState.isCoordinatorEditorOwned(retainedCoordinator));
+                if (isBorrowedLiveHostGraph) {
+                    throw new Error("Graphless scene replacement is unavailable while editing a borrowed live-host graph.");
+                }
+                if (this.props.globalState.hasImportScopedRuntime) {
+                    throw new Error("Graphless scene replacement is unavailable for KHR_interactivity imports because their runtime services belong to the current asset.");
+                }
+            }
+
+            let sourceGlb: GlobalState["sourceGlb"] = null;
+            if (/\.glb$/i.test(file.name)) {
+                try {
+                    const document = ReadGlbDocument(new Uint8Array(await file.arrayBuffer()));
+                    const hasAnimations = document.animations !== undefined && (!Array.isArray(document.animations) || document.animations.length > 0);
+                    sourceGlb = {
+                        file,
+                        companionFiles,
+                        nodeCount: Array.isArray(document.nodes) ? document.nodes.length : 0,
+                        hasAnimations,
+                        authoredBehavior,
+                        externalResourceUris: GetGlbExternalResourceUris(document),
+                    };
+                } catch (error) {
+                    if (stagedKhrImport) {
+                        throw error;
+                    }
+                    // The preview can still load files outside this patcher's supported GLB framing.
+                }
+            }
+            if (!this._canvasHostRef.current) {
+                throw new Error("Scene preview pane moved while loading. Drop the file again in the current preview.");
+            }
+            if (
+                !stagedGraphState &&
+                previousSceneContext &&
+                retainedCoordinator &&
+                this.props.globalState.isCoordinatorEditorOwned(retainedCoordinator) &&
+                retainedCoordinator.config.scene === previousSceneContext.scene
+            ) {
+                retainedCoordinator._setScene(scene, false);
+            }
+            this.props.globalState.sceneContext = stagedSceneContext;
+            this._attachPreviewCanvas();
+            this._setupEngineRenderLoop(scene, engine);
+            this.props.globalState.sceneSource = "file";
+            this.props.globalState.sourceGlb = sourceGlb;
+            this.props.globalState.sourceGltf =
+                stagedKhrImport && /\.gltf$/i.test(file.name)
+                    ? {
+                          file,
+                          externalResourceUris: GetGlbExternalResourceUris({
+                              buffers: stagedKhrImport.importResult.glTF.buffers,
+                              images: stagedKhrImport.importResult.glTF.images,
+                          }),
+                      }
+                    : null;
+            this.props.globalState.snippetId = "";
+            if (stagedGraphState) {
+                SerializationTools.ApplyDeserializedState(stagedGraphState, this.props.globalState);
+                stagedGraphState = null;
+            }
+            this.props.globalState.khrInteractivityImportResult = stagedKhrImport?.importResult ?? null;
+            this.props.globalState.onSceneContextChanged.notifyObservers(stagedSceneContext);
+            this.setState({ sceneObjectCount: stagedSceneContext.entries.length });
+            if (previousSceneContext && previousSceneContext !== stagedSceneContext) {
+                this._disposeSceneContext(previousSceneContext);
+            }
+
+            if (stagedKhrImport) {
+                this._logKhrInteractivityImport(stagedKhrImport.importResult, file.name);
+            } else if (importedCustomGraph) {
+                this.props.globalState.stateManager.onSelectionChangedObservable.notifyObservers(null);
+                this.props.globalState.onClearUndoStack.notifyObservers();
+                this.props.globalState.onLogRequiredObservable.notifyObservers(new LogEntry(`Imported flow graph from "${file.name}" (BABYLON_flow_graph extension)`, false));
+            }
+
+            const sceneObjectCount = stagedSceneContext.entries.length;
+            stagedSceneContext = null;
+            stagedScene = null;
+            stagedEngine = null;
+            this.setState({ isLoading: false, snippetId: "" });
+            this.props.globalState.onLogRequiredObservable.notifyObservers(new LogEntry(`Loaded "${file.name}" with ${sceneObjectCount} scene objects`, false));
+            return true;
+        } catch (err: any) {
+            stagedGraphState?.coordinator.dispose();
+            if (stagedSceneContext) {
+                this._disposeSceneContext(stagedSceneContext);
+            } else {
+                stagedScene?.dispose();
+                stagedEngine?.dispose();
+            }
+            // Clean up registered files on failure
+            try {
+                const { FilesInputStore } = await import("core/Misc/filesInputStore");
+                for (const key of registeredFiles) {
+                    delete FilesInputStore.FilesToLoad[key];
+                }
+            } catch {
+                // FilesInputStore import may itself fail — nothing to clean up
+            }
+            this.setState({
+                isLoading: false,
+                error: err.message || "Failed to load file",
+            });
+            this.props.globalState.onLogRequiredObservable.notifyObservers(new LogEntry(`Failed to load file: ${err.message}`, true));
+            return false;
+        }
+    }
+
+    private _handleDragOver = (e: DragEvent | React.DragEvent) => {
+        e.preventDefault();
+        e.stopPropagation();
+    };
+
+    private _handleDrop = (e: DragEvent | React.DragEvent) => {
+        e.preventDefault();
+        e.stopPropagation();
+
+        if (this.state.isLoading) {
+            return; // Don't start a new load while one is in progress
+        }
+
+        const files = e.dataTransfer?.files;
+        if (!files || files.length === 0) {
+            return;
+        }
+
+        // Find the first supported 3D file
+        const supportedExtensions = [".glb", ".gltf", ".babylon"];
+        for (let i = 0; i < files.length; i++) {
+            const file = files[i];
+            const name = file.name.toLowerCase();
+            if (supportedExtensions.some((ext) => name.endsWith(ext))) {
+                // Collect companion files (bin, textures) to register in the virtual FS
+                const companions: File[] = [];
+                for (let j = 0; j < files.length; j++) {
+                    if (j !== i) {
+                        companions.push(files[j]);
+                    }
+                }
+                void this._loadFileAsync(file, companions);
+                return;
+            }
+        }
+
+        this.props.globalState.onLogRequiredObservable.notifyObservers(new LogEntry("Unsupported file format. Drop a .glb, .gltf, or .babylon file.", true));
+    };
+
+    /**
+     * Extract a snippet ID from user input that may be a full playground URL.
+     * The snippet loader accepts "ID" and "ID#version" directly, so we only
+     * need to strip the URL prefix when present.
+     * @param input - the raw user input string
+     * @returns the cleaned snippet ID (e.g. "ABC123#4")
+     */
+    private _extractSnippetId(input: string): string {
+        let cleaned = input.trim();
+
+        // Full URL: https://playground.babylonjs.com/#ABC123#4
+        if (cleaned.includes("playground.babylonjs.com")) {
+            const hashIndex = cleaned.indexOf("#");
+            if (hashIndex !== -1) {
+                cleaned = cleaned.substring(hashIndex + 1);
+            }
+        }
+
+        // Remove leading # if present
+        if (cleaned.startsWith("#")) {
+            cleaned = cleaned.substring(1);
+        }
+
+        return cleaned;
+    }
+
+    /**
+     * Load a playground snippet, execute it, and populate the scene context.
+     */
+    async loadSnippetAsync() {
+        const { snippetId } = this.state;
+        if (!snippetId) {
+            return;
+        }
+        if (this._blockImportScopedSceneReplacement()) {
+            return;
+        }
+
+        this.setState({ isLoading: true, error: "" });
+
+        try {
+            const cleanId = this._extractSnippetId(snippetId);
+            const result = await LoadSnippet(cleanId, { moduleFormat: "script", assetBaseUrl: "https://playground.babylonjs.com/" });
+
+            if (result.type !== "playground") {
+                throw new Error(`Only playground snippets are supported (got "${result.type}")`);
+            }
+
+            const pgResult = result as IPlaygroundSnippetResult;
+
+            if (this._blockImportScopedSceneReplacement()) {
+                this.setState({ isLoading: false });
+                return;
+            }
+            // Dispose old preview context if any
+            this._disposeCurrentScene();
+
+            const canvas = this.props.globalState.scenePreviewCanvas;
+            if (!canvas) {
+                throw new Error("Preview canvas not available");
+            }
+
+            // Initialize runtime dependencies (Havok, Ammo, Recast) if the snippet uses them
+            await pgResult.initializeRuntimeAsync({ loadScripts: true });
+
+            // Wrap the global BABYLON `...FromSnippetAsync` loaders before the
+            // snippet runs so we capture the flow graph snippet id from a call
+            // that actually executes. This is installed before createEngine
+            // because TS snippets bind their `@babylonjs/core` imports (via the
+            // snippet loader's BABYLON proxy module) the first time createEngine
+            // triggers module evaluation; script snippets call the global
+            // directly at createScene time. A commented-out or string-literal
+            // loader never executes, so it is never captured.
+            const snippetCapture = CaptureFlowGraphSnippetId((globalThis as any).BABYLON);
+
+            let scene: Scene;
+            try {
+                // Create engine and scene using the snippet loader's ready-to-call functions
+                const engine = await pgResult.createEngine(canvas, {
+                    engineOptions: { preserveDrawingBuffer: true, stencil: true },
+                });
+
+                scene = await pgResult.createScene(engine, canvas);
+
+                if (!scene || !scene.render) {
+                    throw new Error("createScene() did not return a valid Scene");
+                }
+
+                // Catch unhandled promise rejections from async operations started
+                // by the snippet (e.g. SceneLoader.Append that fires after
+                // createScene returns).  Mirror the Playground's approach of
+                // surfacing these errors in the log rather than crashing.
+                const rejectionHandler = (e: PromiseRejectionEvent) => {
+                    e.preventDefault();
+                    const msg = e.reason?.message || String(e.reason);
+                    this.props.globalState.onLogRequiredObservable.notifyObservers(new LogEntry(`Snippet error: ${msg}`, true));
+                };
+                window.addEventListener("unhandledrejection", rejectionHandler);
+
+                // Start the render loop with resize handling
+                this._setupEngineRenderLoop(scene, engine);
+
+                scene.onDisposeObservable.addOnce(() => {
+                    window.removeEventListener("unhandledrejection", rejectionHandler);
+                });
+
+                // Wait for the scene to finish loading all pending data (e.g.
+                // async SceneLoader.Append / ImportMesh calls inside the snippet)
+                // and for render targets to be ready (needed for pointer picking)
+                // before cataloguing objects and wiring the flow graph.
+                await scene.whenReadyAsync(true);
+            } finally {
+                // Restore the original loaders once the snippet has finished running.
+                snippetCapture.restore();
+            }
+
+            // Build the scene context
+            const sceneContext = this._publishSceneContext(scene, "snippet");
+            this.props.globalState.snippetId = this.state.snippetId;
+
+            this.setState({ isLoading: false });
+
+            const langTag = pgResult.language === "TS" ? " [TypeScript]" : "";
+            this.props.globalState.onLogRequiredObservable.notifyObservers(new LogEntry(`Loaded snippet${langTag} with ${sceneContext.entries.length} scene objects`, false));
+
+            // If the playground built its flow graph from a snippet at runtime,
+            // open that snippet in the editor so it becomes editable. Saving
+            // afterwards publishes a new version of that same flow graph snippet.
+            await this._tryLoadReferencedFlowGraphAsync(snippetCapture.snippetId);
+
+            // The playground's own code typically builds and starts a
+            // FlowGraphCoordinator on the preview scene, so the graph would be
+            // running the moment the scene loads. Stop those coordinators so the
+            // preview waits for the user to press Start in the editor instead of
+            // running immediately. The editor's editable copy lives on its own
+            // scene (globalState.scene), not this preview scene, so it is unaffected.
+            await this._stopSceneFlowGraphCoordinatorsAsync(scene);
+        } catch (err: any) {
+            this.setState({
+                isLoading: false,
+                error: err.message || "Failed to load snippet",
+            });
+
+            this.props.globalState.onLogRequiredObservable.notifyObservers(new LogEntry(`Failed to load snippet: ${err.message}`, true));
+
+            // Notify listeners that the reload failed so waiting promises (e.g. _onResetAsync) don't hang
+            this.props.globalState.onSceneContextChanged.notifyObservers(null);
+        }
+    }
+
+    /**
+     * When the just-run playground loaded a flow graph from a snippet at runtime,
+     * open that snippet in the editor for editing. The loaded snippet id is
+     * remembered so the next save publishes a new version of it.
+     * @param flowGraphSnippetId - the snippet id captured from the playground's live `...FromSnippetAsync` call, or null
+     */
+    private async _tryLoadReferencedFlowGraphAsync(flowGraphSnippetId: Nullable<string>): Promise<void> {
+        if (!flowGraphSnippetId) {
+            return;
+        }
+
+        try {
+            const loadedId = await SerializationTools.LoadFromSnippetServerAsync(flowGraphSnippetId, this.props.globalState);
+            if (loadedId) {
+                this.props.globalState.stateManager.onSelectionChangedObservable.notifyObservers(null);
+                this.props.globalState.onClearUndoStack.notifyObservers();
+                this.props.globalState.onLogRequiredObservable.notifyObservers(
+                    new LogEntry(`Loaded flow graph snippet ${loadedId} referenced by the playground — edit and save to publish a new version`, false)
+                );
+                ShowToast(this.props.globalState, `Flow graph ${loadedId} loaded for editing`, "success");
+            } else {
+                this.props.globalState.onLogRequiredObservable.notifyObservers(
+                    new LogEntry(`The playground references flow graph snippet ${flowGraphSnippetId}, but it could not be loaded`, true)
+                );
+            }
+        } catch (err: any) {
+            this.props.globalState.onLogRequiredObservable.notifyObservers(
+                new LogEntry(`Could not load the flow graph snippet ${flowGraphSnippetId} referenced by the playground: ${err?.message ?? err}`, true)
+            );
+        }
+    }
+
+    /**
+     * Dispose every {@link FlowGraphCoordinator} the playground created on the preview
+     * scene. Playgrounds usually call `coordinator.start()` (directly or via
+     * `ParseFlowGraphCoordinatorFromSnippetAsync` + `start`), which would leave the graph
+     * running as soon as the scene loads. Disposing the coordinators leaves the scene
+     * static until the user presses Start in the editor, which runs the editor's own
+     * (separate) copy of the graph against this preview scene.
+     * @param scene - the preview scene whose coordinators should be stopped
+     */
+    private async _stopSceneFlowGraphCoordinatorsAsync(scene: Scene): Promise<void> {
+        const { FlowGraphCoordinator } = await import("core/FlowGraph/flowGraphCoordinator");
+        const coordinators = FlowGraphCoordinator.SceneCoordinators.get(scene);
+        if (!coordinators || coordinators.length === 0) {
+            return;
+        }
+        // dispose() mutates the registry array in place, so iterate over a copy.
+        for (const coordinator of [...coordinators]) {
+            coordinator.dispose();
+        }
+    }
+
+    private _handleKeyDown = (e: React.KeyboardEvent) => {
+        if (e.key === "Enter") {
+            void this.loadSnippetAsync();
+        }
+    };
+
+    private _canCreateKhrBehavior(): boolean {
+        const globalState = this.props.globalState;
+        const coordinator = globalState.coordinator;
+        const graph = coordinator?.flowGraphs[0];
+        if (
+            !globalState.sceneContext?.ownsScene ||
+            (globalState.sceneSource === "file" && (!globalState.sourceGlb || globalState.sourceGlb.nodeCount === 0 || globalState.sourceGlb.authoredBehavior)) ||
+            globalState.hasImportScopedRuntime ||
+            !graph ||
+            coordinator?.flowGraphs.length !== 1 ||
+            graph.getAllBlocks().length !== 0
+        ) {
+            return false;
+        }
+        for (let index = 0; index < graph.contextCount; index++) {
+            if (Object.keys(graph.getContext(index).userVariables).length > 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private async _createKhrBehaviorAsync(): Promise<void> {
+        const ctx = this.props.globalState.sceneContext;
+        const trigger = ctx?.meshes.find((mesh) => String(mesh.uniqueId) === this.state.triggerMeshId);
+        const reveal = ctx?.meshes.find((mesh) => String(mesh.uniqueId) === this.state.revealMeshId);
+        const procedureMeshes = Object.fromEntries(
+            (["first", "second", "nextCue", "completionCue", "reset"] as const).map((role) => [
+                role,
+                ctx?.meshes.find((mesh) => String(mesh.uniqueId) === this.state.procedureMeshIds[role]),
+            ])
+        ) as unknown as IKhrTwoStepProcedureNodes<AbstractMesh | undefined>;
+        const isProcedure = this.state.behaviorKind === "procedure";
+        if (!ctx || (isProcedure ? Object.values(procedureMeshes).some((mesh) => !mesh) : !trigger || !reveal) || !this._canCreateKhrBehavior() || this.state.isLoading) {
+            return;
+        }
+
+        this.setState({ isLoading: true, error: "", showAuthoringDialog: false });
+        try {
+            if (isProcedure) {
+                ValidateKhrTwoStepProcedureMeshes(procedureMeshes as IKhrTwoStepProcedureNodes<AbstractMesh>);
+            }
+            const sourceGlb = this.props.globalState.sourceGlb;
+            if (this.props.globalState.sceneSource === "file" && sourceGlb) {
+                const sourceBytes = new Uint8Array(await sourceGlb.file.arrayBuffer());
+                let authoredBytes: Uint8Array;
+                if (isProcedure) {
+                    const indices = Object.fromEntries(
+                        (["first", "second", "nextCue", "completionCue", "reset"] as const).map((role) => [role, GetGlbNodeIndex(procedureMeshes[role]!, sourceGlb.nodeCount)])
+                    ) as unknown as IKhrTwoStepProcedureNodes<number | undefined>;
+                    if (Object.values(indices).some((index) => index === undefined)) {
+                        throw new Error("All procedure meshes must resolve to nodes in the source GLB.");
+                    }
+                    authoredBytes = PatchKhrTwoStepProcedureGlb(sourceBytes, indices as IKhrTwoStepProcedureNodes<number>);
+                } else {
+                    const triggerIndex = GetGlbNodeIndex(trigger!, sourceGlb.nodeCount);
+                    const revealIndex = GetGlbNodeIndex(reveal!, sourceGlb.nodeCount);
+                    if (triggerIndex === undefined || revealIndex === undefined) {
+                        throw new Error("Both meshes must resolve to nodes in the source GLB.");
+                    }
+                    authoredBytes = PatchKhrSelectionRevealGlb(sourceBytes, triggerIndex, revealIndex);
+                }
+                const fileName = sourceGlb.file.name.replace(/\.glb$/i, "-behavior.glb");
+                const authoredFile = new File([new Uint8Array(authoredBytes)], fileName, { type: "model/gltf-binary" });
+                if (!(await this._loadFileAsync(authoredFile, sourceGlb.companionFiles, true, true))) {
+                    throw new Error("The authored GLB could not be loaded for preview.");
+                }
+                const downloadUrl = URL.createObjectURL(authoredFile);
+                const link = this.props.globalState.scenePreviewCanvas!.ownerDocument.createElement("a");
+                link.href = downloadUrl;
+                link.download = fileName;
+                this.props.globalState.scenePreviewCanvas!.ownerDocument.body.appendChild(link);
+                link.click();
+                link.remove();
+                setTimeout(() => URL.revokeObjectURL(downloadUrl), 60_000);
+                this.props.globalState.onLogRequiredObservable.notifyObservers(new LogEntry(`Downloaded source-preserving ${fileName}`, false));
+                if (sourceGlb.externalResourceUris.length > 0) {
+                    this.props.globalState.onLogRequiredObservable.notifyObservers(
+                        new LogEntry(`The downloaded GLB still needs its external resources at their referenced paths: ${sourceGlb.externalResourceUris.join(", ")}`, false)
+                    );
+                }
+                return;
+            }
+            const serializer = (globalThis as any).BABYLON?.GLTF2Export;
+            if (!serializer) {
+                throw new Error("GLTF2Export is not available.");
+            }
+            const khrInteractivity = isProcedure
+                ? CreateKhrTwoStepProcedureTemplate(procedureMeshes as IKhrTwoStepProcedureNodes<AbstractMesh>)
+                : CreateKhrSelectionRevealTemplate(trigger!, reveal!);
+            const fileStem = isProcedure ? "twoStepProcedure" : "selectionReveal";
+            const data = await serializer.GLBAsync(ctx.scene, fileStem, { khrInteractivity });
+            const glb = data.files[`${fileStem}.glb`];
+            if (!(glb instanceof Blob)) {
+                throw new Error("The glTF serializer did not produce a GLB.");
+            }
+            const exportedDocument = ReadGlbDocument(new Uint8Array(await glb.arrayBuffer()));
+            if (exportedDocument.animations !== undefined && (!Array.isArray(exportedDocument.animations) || exportedDocument.animations.length > 0)) {
+                throw new Error("Adding a behavior graph would stop the source GLB's animations from playing automatically; animated GLBs need explicit animation behavior.");
+            }
+            await this._loadFileAsync(new File([glb], `${fileStem}.glb`, { type: "model/gltf-binary" }), undefined, true);
+        } catch (err) {
+            const message = `Could not create KHR_interactivity behavior: ${err instanceof Error ? err.message : String(err)}`;
+            this.setState({ isLoading: false, error: message });
+            this.props.globalState.onLogRequiredObservable.notifyObservers(new LogEntry(message, true));
+        }
+    }
+
+    /** @internal */
+    override render() {
+        const { classes } = this.props;
+        const { snippetId, isLoading, error, sceneObjectCount } = this.state;
+        const ctx = this.props.globalState.sceneContext;
+        const isHostMode = this.props.globalState.sceneSource === "host";
+        const sourceGlb = this.props.globalState.sourceGlb;
+        const externalResourceWarning = sourceGlb?.externalResourceUris.length
+            ? `This GLB references external resources: ${sourceGlb.externalResourceUris.join(", ")}. Keep them at their referenced paths when sharing or reopening the downloaded GLB.`
+            : "";
+        const seenNodeIndices = new Set<number>();
+        const meshes =
+            ctx?.meshes.filter((mesh) => {
+                if (mesh.isDisposed() || mesh.getTotalVertices() === 0) {
+                    return false;
+                }
+                if (this.props.globalState.sceneSource !== "file" || !sourceGlb) {
+                    return true;
+                }
+                const index = GetGlbNodeIndex(mesh, sourceGlb.nodeCount);
+                if (index === undefined || seenNodeIndices.has(index)) {
+                    return false;
+                }
+                seenNodeIndices.add(index);
+                return true;
+            }) ?? [];
+        const trigger = meshes.find((mesh) => String(mesh.uniqueId) === this.state.triggerMeshId);
+        const reveal = meshes.find((mesh) => String(mesh.uniqueId) === this.state.revealMeshId);
+        const procedureRoles = [
+            { role: "first", label: "First part" },
+            { role: "second", label: "Second part" },
+            { role: "nextCue", label: "Next-step cue" },
+            { role: "completionCue", label: "Completion cue" },
+            { role: "reset", label: "Reset control" },
+        ] as const;
+        const procedureMeshes = Object.fromEntries(
+            procedureRoles.map(({ role }) => [role, meshes.find((mesh) => String(mesh.uniqueId) === this.state.procedureMeshIds[role])])
+        ) as unknown as IKhrTwoStepProcedureNodes<AbstractMesh | undefined>;
+        let procedureSelectionValid = false;
+        if (Object.values(procedureMeshes).every((mesh) => !!mesh)) {
+            try {
+                ValidateKhrTwoStepProcedureMeshes(procedureMeshes as IKhrTwoStepProcedureNodes<AbstractMesh>);
+                procedureSelectionValid = true;
+                if (sourceGlb && this.props.globalState.sceneSource === "file") {
+                    const indices = Object.values(procedureMeshes).map((mesh) => GetGlbNodeIndex(mesh!, sourceGlb.nodeCount));
+                    procedureSelectionValid = indices.every((index) => index !== undefined) && new Set(indices).size === indices.length;
+                }
+            } catch {
+                // Keep Create disabled until the roles are unambiguous and usable.
+            }
+        }
+        const meshLabel = (mesh: (typeof meshes)[number]) =>
+            sourceGlb && this.props.globalState.sceneSource === "file"
+                ? `${mesh.name || "Mesh"} (glTF node ${GetGlbNodeIndex(mesh, sourceGlb.nodeCount)})`
+                : `${mesh.name || "Mesh"} (#${mesh.uniqueId})`;
+        const sourceHasAnimations = this.props.globalState.sceneSource === "file" && !!sourceGlb?.hasAnimations;
+        const canOpenAuthoring = this._canCreateKhrBehavior();
+        const canCreate = canOpenAuthoring && !sourceHasAnimations;
+        const createTitle =
+            this.props.globalState.sceneSource === "file" && !sourceGlb
+                ? "Drop a GLB to add a behavior without changing its source scene data"
+                : sourceGlb?.authoredBehavior
+                  ? "This GLB already has an authored behavior"
+                  : sourceHasAnimations
+                    ? "Animated GLBs need explicit animation behavior"
+                    : canCreate
+                      ? "Create a glTF selection behavior"
+                      : "Start with one empty graph to create a glTF behavior";
+
+        return (
+            <div className={classes.container}>
+                <div className={classes.loader}>
+                    <div className={classes.inputRow}>
+                        <Input
+                            className={classes.fillInput}
+                            size="small"
+                            placeholder="Playground ID or URL..."
+                            value={snippetId}
+                            onChange={(_, data) => this.setState({ snippetId: data.value })}
+                            onKeyDown={this._handleKeyDown}
+                            disabled={isLoading}
+                        />
+                        <Button size="small" appearance="primary" onClick={() => void this.loadSnippetAsync()} disabled={isLoading || !snippetId}>
+                            {isLoading ? "..." : "Load"}
+                        </Button>
+                        {ctx?.ownsScene && !this.props.globalState.hasImportScopedRuntime && (
+                            <Button size="small" title={createTitle} onClick={() => this.setState({ showAuthoringDialog: true })} disabled={isLoading || !canOpenAuthoring}>
+                                New behavior
+                            </Button>
+                        )}
+                    </div>
+                    {error && <Body1 className={classes.error}>{error}</Body1>}
+                    {externalResourceWarning && <Body1 data-testid="external-resource-warning-status">{externalResourceWarning}</Body1>}
+                    {ctx && (
+                        <div className={classes.status}>
+                            <Body1 className={classes.statusCount}>{sceneObjectCount}</Body1> objects in scene context
+                            <Tooltip content="Flow graph execution contexts will resolve asset references from this scene" relationship="description">
+                                <Body1 className={classes.statusWired}>
+                                    <CheckmarkRegular /> wired to flow graph
+                                </Body1>
+                            </Tooltip>
+                        </div>
+                    )}
+                </div>
+                <div className={classes.canvasContainer} onDragOver={this._handleDragOver as React.DragEventHandler} onDrop={this._handleDrop as React.DragEventHandler}>
+                    <div ref={this._canvasHostRef} className={classes.canvasHost} data-testid="scene-preview-canvas-host" />
+                    {isHostMode && (
+                        <div
+                            style={{
+                                position: "absolute",
+                                inset: 0,
+                                display: "flex",
+                                alignItems: "center",
+                                justifyContent: "center",
+                                textAlign: "center",
+                                padding: "16px",
+                                pointerEvents: "none",
+                            }}
+                        >
+                            <Body1>Connected to the live application scene. The graph runs directly against it — no preview render is shown.</Body1>
+                        </div>
+                    )}
+                </div>
+                {ctx && <div className={classes.summary}>{this._renderCategorySummary(ctx)}</div>}
+                <Dialog open={this.state.showAuthoringDialog} onOpenChange={(_, data) => this.setState({ showAuthoringDialog: data.open })}>
+                    <DialogSurface className={classes.authoringDialog}>
+                        <DialogBody>
+                            <DialogTitle>{this.state.behaviorKind === "procedure" ? "New glTF two-step procedure" : "New glTF selection behavior"}</DialogTitle>
+                            <DialogContent className={classes.authoring}>
+                                <Label htmlFor="khr-behavior-kind">Behavior type</Label>
+                                <Dropdown
+                                    id="khr-behavior-kind"
+                                    aria-label="Behavior type"
+                                    className={classes.authoringSelect}
+                                    value={this.state.behaviorKind === "procedure" ? "Two-step procedure" : "Select to reveal"}
+                                    selectedOptions={[this.state.behaviorKind]}
+                                    onOptionSelect={(_, data) => this.setState({ behaviorKind: data.optionValue === "procedure" ? "procedure" : "reveal" })}
+                                >
+                                    <Option value="reveal">Select to reveal</Option>
+                                    <Option value="procedure">Two-step procedure</Option>
+                                </Dropdown>
+                                <Body1>
+                                    {this.state.behaviorKind === "procedure"
+                                        ? "Select the first part, then the second. The cues appear as you progress; selecting Reset starts over."
+                                        : "Selecting the trigger will reveal the second mesh."}
+                                </Body1>
+                                {sourceHasAnimations && (
+                                    <Body1>This GLB has animations. Adding a graph would stop automatic playback; animated GLBs need explicit animation behavior.</Body1>
+                                )}
+                                <Body1>
+                                    {this.props.globalState.sceneSource === "file"
+                                        ? "The source GLB is patched and downloaded. Its original scene data and binary chunks are retained."
+                                        : "The preview scene is exported and reloaded as glTF; Babylon-only scene features may be omitted."}
+                                </Body1>
+                                {externalResourceWarning && <Body1 data-testid="external-resource-warning-dialog">{externalResourceWarning}</Body1>}
+                                {this.state.behaviorKind === "procedure" ? (
+                                    procedureRoles.map(({ role, label }) => {
+                                        const selected = procedureMeshes[role];
+                                        return (
+                                            <React.Fragment key={role}>
+                                                <Label htmlFor={`khr-procedure-${role}`}>{label}</Label>
+                                                <Dropdown
+                                                    id={`khr-procedure-${role}`}
+                                                    aria-label={label}
+                                                    className={classes.authoringSelect}
+                                                    placeholder={`Select ${label.toLowerCase()}`}
+                                                    value={selected ? meshLabel(selected) : ""}
+                                                    selectedOptions={selected ? [String(selected.uniqueId)] : []}
+                                                    onOptionSelect={(_, data) =>
+                                                        this.setState({ procedureMeshIds: { ...this.state.procedureMeshIds, [role]: data.optionValue ?? "" } })
+                                                    }
+                                                >
+                                                    {meshes.map((mesh) => (
+                                                        <Option key={mesh.uniqueId} value={String(mesh.uniqueId)} text={meshLabel(mesh)}>
+                                                            {meshLabel(mesh)}
+                                                        </Option>
+                                                    ))}
+                                                </Dropdown>
+                                            </React.Fragment>
+                                        );
+                                    })
+                                ) : (
+                                    <>
+                                        <Label htmlFor="khr-trigger-mesh">Trigger mesh</Label>
+                                        <Dropdown
+                                            id="khr-trigger-mesh"
+                                            aria-label="Trigger mesh"
+                                            className={classes.authoringSelect}
+                                            placeholder="Select trigger mesh"
+                                            value={trigger ? meshLabel(trigger) : ""}
+                                            selectedOptions={trigger ? [String(trigger.uniqueId)] : []}
+                                            onOptionSelect={(_, data) => this.setState({ triggerMeshId: data.optionValue ?? "" })}
+                                        >
+                                            {meshes.map((mesh) => (
+                                                <Option key={mesh.uniqueId} value={String(mesh.uniqueId)} text={meshLabel(mesh)}>
+                                                    {meshLabel(mesh)}
+                                                </Option>
+                                            ))}
+                                        </Dropdown>
+                                        <Label htmlFor="khr-reveal-mesh">Mesh to reveal</Label>
+                                        <Dropdown
+                                            id="khr-reveal-mesh"
+                                            aria-label="Mesh to reveal"
+                                            className={classes.authoringSelect}
+                                            placeholder="Select mesh to reveal"
+                                            value={reveal ? meshLabel(reveal) : ""}
+                                            selectedOptions={reveal ? [String(reveal.uniqueId)] : []}
+                                            onOptionSelect={(_, data) => this.setState({ revealMeshId: data.optionValue ?? "" })}
+                                        >
+                                            {meshes.map((mesh) => (
+                                                <Option key={mesh.uniqueId} value={String(mesh.uniqueId)} text={meshLabel(mesh)}>
+                                                    {meshLabel(mesh)}
+                                                </Option>
+                                            ))}
+                                        </Dropdown>
+                                    </>
+                                )}
+                            </DialogContent>
+                            <DialogActions>
+                                <Button onClick={() => this.setState({ showAuthoringDialog: false })}>Cancel</Button>
+                                <Button
+                                    appearance="primary"
+                                    disabled={
+                                        isLoading ||
+                                        !canCreate ||
+                                        (this.state.behaviorKind === "procedure"
+                                            ? !procedureSelectionValid
+                                            : !trigger ||
+                                              !reveal ||
+                                              trigger === reveal ||
+                                              trigger.isDescendantOf(reveal) ||
+                                              (!!sourceGlb && GetGlbNodeIndex(trigger, sourceGlb.nodeCount) === GetGlbNodeIndex(reveal, sourceGlb.nodeCount)) ||
+                                              !trigger.isEnabled() ||
+                                              !trigger.isVisible ||
+                                              !trigger.isPickable ||
+                                              !reveal.isEnabled())
+                                    }
+                                    onClick={() => void this._createKhrBehaviorAsync()}
+                                >
+                                    Create behavior
+                                </Button>
+                            </DialogActions>
+                        </DialogBody>
+                    </DialogSurface>
+                </Dialog>
+            </div>
+        );
+    }
+
+    private _renderCategorySummary(ctx: SceneContext) {
+        const { classes } = this.props;
+        const categories = [
+            { label: "Meshes", count: ctx.meshes.length },
+            { label: "Lights", count: ctx.lights.length },
+            { label: "Cameras", count: ctx.cameras.length },
+            { label: "Materials", count: ctx.materials.length },
+            { label: "Transform Nodes", count: ctx.transformNodes.length },
+            { label: "Animation Groups", count: ctx.animationGroups.length },
+            { label: "Skeletons", count: ctx.skeletons.length },
+            { label: "Particle Systems", count: ctx.particleSystems.length },
+        ].filter((c) => c.count > 0);
+
+        return (
+            <div>
+                {categories.map((c) => (
+                    <div key={c.label} className={classes.categoryItem}>
+                        <Body1 className={classes.categoryLabel}>{c.label}</Body1>
+                        <Body1 className={classes.categoryCount}>{c.count}</Body1>
+                    </div>
+                ))}
+            </div>
+        );
+    }
+}

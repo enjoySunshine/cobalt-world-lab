@@ -1,0 +1,584 @@
+/* eslint-disable @typescript-eslint/naming-convention */
+import { type BaseTexture } from "core/Materials/Textures/baseTexture";
+import { type InternalTexture } from "../Materials/Textures/internalTexture";
+import { Texture } from "../Materials/Textures/texture.pure";
+import { RenderTargetTexture } from "../Materials/Textures/renderTargetTexture.pure";
+import { PassPostProcess } from "../PostProcesses/passPostProcess.pure";
+import { Constants } from "../Engines/constants";
+import { type Scene } from "../scene";
+import { PostProcess } from "../PostProcesses/postProcess.pure";
+import { ShaderLanguage } from "core/Materials/shaderLanguage";
+import { MapSRGBToLinear } from "./textureFormat.functions";
+import { type Nullable } from "../types";
+import { Clamp } from "../Maths/math.scalar.functions";
+import { FromHalfFloat, ToHalfFloat } from "./halfFloat";
+
+export { FromHalfFloat, ToHalfFloat };
+
+const DisplayGamma = 0;
+const PreserveChannels = 1;
+const RestoreHardwareSRGB = 2;
+
+/**
+ * Uses the GPU to create a copy texture rescaled at a given size
+ * @param texture Texture to copy from
+ * @param width defines the desired width
+ * @param height defines the desired height
+ * @param useBilinearMode defines if bilinear mode has to be used
+ * @returns the generated texture
+ */
+export function CreateResizedCopy(texture: Texture, width: number, height: number, useBilinearMode: boolean = true): Texture {
+    const scene = <Scene>texture.getScene();
+    const engine = scene.getEngine();
+
+    const rtt = new RenderTargetTexture(
+        "resized" + texture.name,
+        { width: width, height: height },
+        scene,
+        !texture.noMipmap,
+        true,
+        (<InternalTexture>texture._texture).type,
+        false,
+        texture.samplingMode,
+        false
+    );
+
+    rtt.wrapU = texture.wrapU;
+    rtt.wrapV = texture.wrapV;
+    rtt.uOffset = texture.uOffset;
+    rtt.vOffset = texture.vOffset;
+    rtt.uScale = texture.uScale;
+    rtt.vScale = texture.vScale;
+    rtt.uAng = texture.uAng;
+    rtt.vAng = texture.vAng;
+    rtt.wAng = texture.wAng;
+    rtt.coordinatesIndex = texture.coordinatesIndex;
+    rtt.level = texture.level;
+    rtt.anisotropicFilteringLevel = texture.anisotropicFilteringLevel;
+    (<InternalTexture>rtt._texture).isReady = false;
+
+    texture.wrapU = Texture.CLAMP_ADDRESSMODE;
+    texture.wrapV = Texture.CLAMP_ADDRESSMODE;
+
+    const passPostProcess = new PassPostProcess(
+        "pass",
+        1,
+        null,
+        useBilinearMode ? Texture.BILINEAR_SAMPLINGMODE : Texture.NEAREST_SAMPLINGMODE,
+        engine,
+        false,
+        Constants.TEXTURETYPE_UNSIGNED_BYTE
+    );
+    passPostProcess.externalTextureSamplerBinding = true;
+    passPostProcess.onEffectCreatedObservable.addOnce((e) => {
+        e.executeWhenCompiled(() => {
+            passPostProcess.onApply = function (effect) {
+                effect.setTexture("textureSampler", texture);
+            };
+
+            const internalTexture = rtt.renderTarget;
+
+            if (internalTexture) {
+                scene.postProcessManager.directRender([passPostProcess], internalTexture);
+
+                engine.unBindFramebuffer(internalTexture);
+                rtt.disposeFramebufferObjects();
+                passPostProcess.dispose();
+
+                rtt.getInternalTexture()!.isReady = true;
+            }
+        });
+    });
+
+    return rtt;
+}
+
+/**
+ * Apply a post process to a texture
+ * @param postProcessName name of the fragment post process
+ * @param internalTexture the texture to encode
+ * @param scene the scene hosting the texture
+ * @param type type of the output texture. If not provided, use the one from internalTexture
+ * @param samplingMode sampling mode to use to sample the source texture. If not provided, use the one from internalTexture
+ * @param format format of the output texture. If not provided, use the one from internalTexture
+ * @param width width of the output texture. If not provided, use the one from internalTexture
+ * @param height height of the output texture. If not provided, use the one from internalTexture
+ * @returns a promise with the internalTexture having its texture replaced by the result of the processing
+ */
+// eslint-disable-next-line @typescript-eslint/promise-function-async
+export function ApplyPostProcess(
+    postProcessName: string,
+    internalTexture: InternalTexture,
+    scene: Scene,
+    type?: number,
+    samplingMode?: number,
+    format?: number,
+    width?: number,
+    height?: number
+): Promise<InternalTexture> {
+    // Gets everything ready.
+    const engine = internalTexture.getEngine();
+
+    internalTexture.isReady = false;
+
+    samplingMode = samplingMode ?? internalTexture.samplingMode;
+    type = type ?? internalTexture.type;
+    format = format ?? internalTexture.format;
+    width = width ?? internalTexture.width;
+    height = height ?? internalTexture.height;
+
+    if (type === -1) {
+        type = Constants.TEXTURETYPE_UNSIGNED_BYTE;
+    }
+
+    return new Promise((resolve) => {
+        // Create the post process
+        const postProcess = new PostProcess("postprocess", postProcessName, null, null, 1, null, samplingMode, engine, false, undefined, type, undefined, null, false, format);
+        postProcess.externalTextureSamplerBinding = true;
+
+        // Hold the output of the decoding.
+        const encodedTexture = engine.createRenderTargetTexture(
+            { width: width, height: height },
+            {
+                generateDepthBuffer: false,
+                generateMipMaps: false,
+                generateStencilBuffer: false,
+                samplingMode,
+                type,
+                format,
+            }
+        );
+
+        postProcess.onEffectCreatedObservable.addOnce((e) => {
+            e.executeWhenCompiled(() => {
+                // PP Render Pass
+                postProcess.onApply = (effect) => {
+                    effect._bindTexture("textureSampler", internalTexture);
+                    effect.setFloat2("scale", 1, 1);
+                };
+                scene.postProcessManager.directRender([postProcess], encodedTexture, true);
+
+                // Cleanup
+                engine.restoreDefaultFramebuffer();
+                engine._releaseTexture(internalTexture);
+                if (postProcess) {
+                    postProcess.dispose();
+                }
+
+                // Internal Swap
+                encodedTexture._swapAndDie(internalTexture);
+
+                // Ready to get rolling again.
+                internalTexture.type = type!;
+                internalTexture.format = Constants.TEXTUREFORMAT_RGBA;
+                internalTexture.isReady = true;
+
+                resolve(internalTexture);
+            });
+        });
+    });
+}
+
+/** @internal */
+export function _IsCompressedTextureFormat(format: number): boolean {
+    switch (format) {
+        case 0x8c00: // COMPRESSED_RGB_PVRTC_4BPPV1_IMG
+        case 0x8c02: // COMPRESSED_RGBA_PVRTC_4BPPV1_IMG
+        case Constants.TEXTUREFORMAT_COMPRESSED_RGBA_BPTC_UNORM:
+        case Constants.TEXTUREFORMAT_COMPRESSED_SRGB_ALPHA_BPTC_UNORM:
+        case Constants.TEXTUREFORMAT_COMPRESSED_RGB_BPTC_UNSIGNED_FLOAT:
+        case Constants.TEXTUREFORMAT_COMPRESSED_RGB_BPTC_SIGNED_FLOAT:
+        case Constants.TEXTUREFORMAT_COMPRESSED_RGBA_S3TC_DXT5:
+        case Constants.TEXTUREFORMAT_COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT:
+        case Constants.TEXTUREFORMAT_COMPRESSED_RGBA_S3TC_DXT3:
+        case Constants.TEXTUREFORMAT_COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT:
+        case Constants.TEXTUREFORMAT_COMPRESSED_RGBA_S3TC_DXT1:
+        case Constants.TEXTUREFORMAT_COMPRESSED_RGB_S3TC_DXT1:
+        case Constants.TEXTUREFORMAT_COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT:
+        case Constants.TEXTUREFORMAT_COMPRESSED_SRGB_S3TC_DXT1_EXT:
+        case Constants.TEXTUREFORMAT_COMPRESSED_RGBA_ASTC_4x4:
+        case Constants.TEXTUREFORMAT_COMPRESSED_RGBA_ASTC_5x4:
+        case Constants.TEXTUREFORMAT_COMPRESSED_RGBA_ASTC_5x5:
+        case Constants.TEXTUREFORMAT_COMPRESSED_RGBA_ASTC_6x5:
+        case Constants.TEXTUREFORMAT_COMPRESSED_RGBA_ASTC_6x6:
+        case Constants.TEXTUREFORMAT_COMPRESSED_RGBA_ASTC_8x5:
+        case Constants.TEXTUREFORMAT_COMPRESSED_RGBA_ASTC_8x6:
+        case Constants.TEXTUREFORMAT_COMPRESSED_RGBA_ASTC_8x8:
+        case Constants.TEXTUREFORMAT_COMPRESSED_RGBA_ASTC_10x5:
+        case Constants.TEXTUREFORMAT_COMPRESSED_RGBA_ASTC_10x6:
+        case Constants.TEXTUREFORMAT_COMPRESSED_RGBA_ASTC_10x8:
+        case Constants.TEXTUREFORMAT_COMPRESSED_RGBA_ASTC_10x10:
+        case Constants.TEXTUREFORMAT_COMPRESSED_RGBA_ASTC_12x10:
+        case Constants.TEXTUREFORMAT_COMPRESSED_RGBA_ASTC_12x12:
+        case Constants.TEXTUREFORMAT_COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR:
+        case Constants.TEXTUREFORMAT_COMPRESSED_SRGB8_ALPHA8_ASTC_5x4_KHR:
+        case Constants.TEXTUREFORMAT_COMPRESSED_SRGB8_ALPHA8_ASTC_5x5_KHR:
+        case Constants.TEXTUREFORMAT_COMPRESSED_SRGB8_ALPHA8_ASTC_6x5_KHR:
+        case Constants.TEXTUREFORMAT_COMPRESSED_SRGB8_ALPHA8_ASTC_6x6_KHR:
+        case Constants.TEXTUREFORMAT_COMPRESSED_SRGB8_ALPHA8_ASTC_8x5_KHR:
+        case Constants.TEXTUREFORMAT_COMPRESSED_SRGB8_ALPHA8_ASTC_8x6_KHR:
+        case Constants.TEXTUREFORMAT_COMPRESSED_SRGB8_ALPHA8_ASTC_8x8_KHR:
+        case Constants.TEXTUREFORMAT_COMPRESSED_SRGB8_ALPHA8_ASTC_10x5_KHR:
+        case Constants.TEXTUREFORMAT_COMPRESSED_SRGB8_ALPHA8_ASTC_10x6_KHR:
+        case Constants.TEXTUREFORMAT_COMPRESSED_SRGB8_ALPHA8_ASTC_10x8_KHR:
+        case Constants.TEXTUREFORMAT_COMPRESSED_SRGB8_ALPHA8_ASTC_10x10_KHR:
+        case Constants.TEXTUREFORMAT_COMPRESSED_SRGB8_ALPHA8_ASTC_12x10_KHR:
+        case Constants.TEXTUREFORMAT_COMPRESSED_SRGB8_ALPHA8_ASTC_12x12_KHR:
+        case Constants.TEXTUREFORMAT_COMPRESSED_RGB_ETC1_WEBGL:
+        case Constants.TEXTUREFORMAT_COMPRESSED_RGB8_ETC2:
+        case Constants.TEXTUREFORMAT_COMPRESSED_SRGB8_ETC2:
+        case Constants.TEXTUREFORMAT_COMPRESSED_RGB8_PUNCHTHROUGH_ALPHA1_ETC2:
+        case Constants.TEXTUREFORMAT_COMPRESSED_SRGB8_PUNCHTHROUGH_ALPHA1_ETC2:
+        case Constants.TEXTUREFORMAT_COMPRESSED_RGBA8_ETC2_EAC:
+        case Constants.TEXTUREFORMAT_COMPRESSED_SRGB8_ALPHA8_ETC2_EAC:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/**
+ * Waits for when the given texture is ready to be used (downloaded, converted, mip mapped...)
+ * @param texture the texture to wait for
+ * @param signal optional signal to abort the readiness wait
+ * @returns a promise that resolves when the texture is ready
+ */
+export async function WhenTextureReadyAsync(texture: BaseTexture, signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
+    if (texture.isReady()) {
+        return;
+    }
+    const internalTexture = texture.getInternalTexture();
+    if (texture.loadingError || internalTexture?._loadError) {
+        throw new Error(texture.errorObject?.message || internalTexture?._loadError?.message || `Texture ${texture.name} errored while loading.`);
+    }
+    const onLoadObservable = (texture as Texture).onLoadObservable ?? texture._texture?.onLoadedObservable;
+    if (!onLoadObservable) {
+        throw new Error(`Cannot determine readiness of texture ${texture.name}.`);
+    }
+    await new Promise<void>((resolve, reject) => {
+        const cleanup = () => {
+            onLoadObservable.removeCallback(onLoad);
+            Texture.OnTextureLoadErrorObservable.remove(onError);
+            internalTexture?.onErrorObservable.remove(onInternalError ?? null);
+            signal?.removeEventListener("abort", onAbort);
+            texture.onDisposeObservable.remove(onDispose);
+        };
+        const fail = (error: Error) => {
+            cleanup();
+            reject(error);
+        };
+        const onLoad = () => {
+            cleanup();
+            resolve();
+        };
+        const onAbort = () => fail(signal!.reason);
+        const onError = Texture.OnTextureLoadErrorObservable.add((failedTexture) => {
+            if (failedTexture === texture) {
+                fail(new Error(texture.errorObject?.message || `Texture ${texture.name} errored while loading.`));
+            }
+        });
+        const onInternalError = internalTexture?.onErrorObservable.add((error) => fail(new Error(error.message || `Texture ${texture.name} errored while loading.`)));
+        const onDispose = texture.onDisposeObservable.add(() => fail(new Error(`Texture ${texture.name} was disposed while waiting for readiness.`)));
+        onLoadObservable.addOnce(onLoad);
+        signal?.addEventListener("abort", onAbort, { once: true });
+        if (signal?.aborted) {
+            onAbort();
+        }
+    });
+}
+
+/**
+ * Gets the data of the specified texture by rendering it to an intermediate RGBA texture and retrieving the bytes from it.
+ * This is convienent to get 8-bit RGBA values for a texture in a GPU compressed format, which cannot be read using readPixels.
+ * @internal
+ */
+async function ReadPixelsUsingRTT(
+    texture: BaseTexture,
+    width: number,
+    height: number,
+    face: number,
+    lod: number,
+    slice: number,
+    applyGammaCorrection: boolean
+): Promise<Uint8Array> {
+    const scene = texture.getScene()!;
+    const engine = scene.getEngine();
+    const sourceInternalTexture = texture.getInternalTexture();
+    const is3DTexture = texture.is3D || !!sourceInternalTexture?.is3D;
+
+    if (!engine.isWebGPU) {
+        if (is3DTexture) {
+            await import("../Shaders/lod3D.fragment");
+        } else if (texture.isCube) {
+            await import("../Shaders/lodCube.fragment");
+        } else {
+            await import("../Shaders/lod.fragment");
+        }
+    } else {
+        if (is3DTexture) {
+            await import("../ShadersWGSL/lod3D.fragment");
+        } else if (texture.isCube) {
+            await import("../ShadersWGSL/lodCube.fragment");
+        } else {
+            await import("../ShadersWGSL/lod.fragment");
+        }
+    }
+
+    let lodPostProcess: PostProcess;
+
+    if (is3DTexture) {
+        lodPostProcess = new PostProcess("lod3D", "lod3D", {
+            uniforms: ["lod", "gamma", "slice"],
+            samplingMode: Texture.NEAREST_NEAREST_MIPNEAREST,
+            engine,
+            shaderLanguage: engine.isWebGPU ? ShaderLanguage.WGSL : ShaderLanguage.GLSL,
+        });
+    } else if (!texture.isCube) {
+        lodPostProcess = new PostProcess("lod", "lod", {
+            uniforms: ["lod", "gamma"],
+            samplingMode: Texture.NEAREST_NEAREST_MIPNEAREST,
+            engine,
+            shaderLanguage: engine.isWebGPU ? ShaderLanguage.WGSL : ShaderLanguage.GLSL,
+        });
+    } else {
+        const faceDefines = ["#define POSITIVEX", "#define NEGATIVEX", "#define POSITIVEY", "#define NEGATIVEY", "#define POSITIVEZ", "#define NEGATIVEZ"];
+        lodPostProcess = new PostProcess("lodCube", "lodCube", {
+            uniforms: ["lod", "gamma"],
+            samplingMode: Texture.NEAREST_NEAREST_MIPNEAREST,
+            engine,
+            defines: faceDefines[face],
+            shaderLanguage: engine.isWebGPU ? ShaderLanguage.WGSL : ShaderLanguage.GLSL,
+        });
+    }
+
+    let rtt: RenderTargetTexture | undefined;
+    try {
+        await new Promise<void>((resolve, reject) => {
+            lodPostProcess.onEffectCreatedObservable.addOnce((effect) => {
+                const cleanup = () => {
+                    effect.onCompileObservable.remove(onCompile);
+                    effect.onErrorObservable.remove(onError);
+                };
+                const onCompile = effect.onCompileObservable.addOnce(() => {
+                    cleanup();
+                    resolve();
+                });
+                const onError = effect.onErrorObservable.addOnce(() => {
+                    cleanup();
+                    reject(new Error(effect.getCompilationError() || "Texture readback shader compilation failed."));
+                });
+                const compilationError = effect.getCompilationError();
+                if (compilationError) {
+                    cleanup();
+                    reject(new Error(compilationError));
+                } else if (effect.isReady()) {
+                    cleanup();
+                    resolve();
+                }
+            });
+        });
+
+        rtt = new RenderTargetTexture("temp", { width: width, height: height }, scene, false);
+
+        lodPostProcess.onApply = function (effect) {
+            effect.setTexture("textureSampler", texture);
+            effect.setFloat("lod", lod);
+            const hardwareSRGB =
+                sourceInternalTexture?._useSRGBBuffer ||
+                MapSRGBToLinear(texture.textureFormat) !== null ||
+                texture.textureFormat === Constants.TEXTUREFORMAT_COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT;
+            effect.setInt("gamma", hardwareSRGB ? RestoreHardwareSRGB : !applyGammaCorrection || texture.gammaSpace ? PreserveChannels : DisplayGamma);
+            if (is3DTexture) {
+                effect.setFloat("slice", slice);
+            }
+        };
+
+        if (rtt.renderTarget && sourceInternalTexture) {
+            const samplingMode = sourceInternalTexture.samplingMode;
+            if (lod !== 0) {
+                texture.updateSamplingMode(Texture.NEAREST_NEAREST_MIPNEAREST);
+            } else {
+                texture.updateSamplingMode(Texture.NEAREST_NEAREST);
+            }
+
+            scene.postProcessManager.directRender([lodPostProcess], rtt.renderTarget, true);
+            texture.updateSamplingMode(samplingMode);
+
+            //Reading datas from WebGL
+            const bufferView = await engine.readPixels(0, 0, width, height);
+            const data = new Uint8Array(bufferView.buffer, bufferView.byteOffset, bufferView.byteLength);
+
+            // Unbind
+            engine.unBindFramebuffer(rtt.renderTarget);
+
+            return data;
+        } else {
+            throw Error("Render to texture failed.");
+        }
+    } finally {
+        rtt?.dispose();
+        lodPostProcess.dispose();
+    }
+}
+
+/**
+ * Gets the pixel data of the specified texture, either by reading it directly
+ * or by rendering it to an intermediate RGBA texture and retrieving the bytes from it.
+ * This is convenient to get 8-bit RGBA values for a texture in a GPU compressed format.
+ * When direct readback returns non-RGBA channel layouts, the result is normalized to RGBA8.
+ * @param texture the source texture
+ * @param width the target width of the result, which does not have to match the source texture width
+ * @param height the target height of the result, which does not have to match the source texture height
+ * @param face if the texture has multiple faces, the face index to use for the source
+ * @param lod if the texture has multiple LODs, the lod index to use for the source
+ * @param forceRTT if true, forces the use of the RTT path for reading pixels (useful for cube maps to ensure correct orientation and gamma)
+ * @param slice if the texture is 3D, the depth slice index to use for the source
+ * @param applyGammaCorrection if true (default), converts linear RTT pixels to display gamma and previews single-channel data as grayscale. If false, preserves sampled channel semantics, including undoing hardware sRGB decoding.
+ * @returns the 8-bit texture data
+ */
+export async function GetTextureDataAsync(
+    texture: BaseTexture,
+    width?: number,
+    height?: number,
+    face: number = 0,
+    lod: number = 0,
+    forceRTT: boolean = false,
+    slice: number = 0,
+    applyGammaCorrection: boolean = true
+): Promise<Uint8Array> {
+    await WhenTextureReadyAsync(texture);
+    const internalTexture = texture.getInternalTexture();
+    const is3DTexture = texture.is3D || !!internalTexture?.is3D;
+
+    const { width: textureWidth, height: textureHeight } = texture.getSize();
+    const targetWidth = width ?? textureWidth;
+    const targetHeight = height ?? textureHeight;
+
+    // If the internal texture format is compressed, we cannot read the pixels directly.
+    // If we're resizing the texture, we need to use a render target texture.
+    // forceRTT can be used to ensure correct orientation and gamma for cube maps.
+    // 3D textures must also use RTT because direct readPixels does not expose slice selection.
+    if (forceRTT || is3DTexture || _IsCompressedTextureFormat(texture.textureFormat) || targetWidth !== textureWidth || targetHeight !== textureHeight) {
+        if (texture.is2DArray) {
+            throw new Error(`Reading pixels from 2D array textures with ${forceRTT ? "RTT" : "compression"} is not supported.`);
+        }
+        return await ReadPixelsUsingRTT(texture, targetWidth, targetHeight, face, lod, slice, applyGammaCorrection);
+    }
+
+    let data = (await texture.readPixels(face, lod)) as Nullable<Uint8Array | Float32Array>;
+    if (!data) {
+        throw new Error(`Failed to read pixels from texture ${texture.name}.`);
+    }
+
+    // Convert float RGBA values to uint8, if necessary.
+    if (data instanceof Float32Array) {
+        const data2 = new Uint8Array(data.length);
+        let n = data.length;
+        while (n--) {
+            const v = data[n];
+            data2[n] = Math.round(Clamp(v) * 255);
+        }
+        data = data2;
+    }
+
+    // Some backends (notably WebGPU for single/dual/triple channel formats) can return
+    // readback data that is not RGBA8. The inspector preview pipeline expects 4 bytes
+    // per pixel, so normalize to RGBA here when needed.
+    const pixelCount = targetWidth * targetHeight;
+    const expectedLength = pixelCount * 4;
+
+    if (data.length !== expectedLength) {
+        const componentCount = pixelCount === 0 ? 0 : data.length / pixelCount;
+
+        if (componentCount === 1 || componentCount === 2 || componentCount === 3) {
+            const normalizedData = new Uint8Array(expectedLength);
+
+            for (let pixel = 0, src = 0, dst = 0; pixel < pixelCount; pixel++, dst += 4) {
+                const c0 = data[src++];
+
+                if (componentCount === 1) {
+                    const alphaOnly = !applyGammaCorrection && texture.textureFormat === Constants.TEXTUREFORMAT_ALPHA;
+                    const redOnly = !applyGammaCorrection && (texture.textureFormat === Constants.TEXTUREFORMAT_R || texture.textureFormat === Constants.TEXTUREFORMAT_RED_INTEGER);
+                    normalizedData[dst] = alphaOnly ? 0 : c0;
+                    normalizedData[dst + 1] = alphaOnly || redOnly ? 0 : c0;
+                    normalizedData[dst + 2] = alphaOnly || redOnly ? 0 : c0;
+                    normalizedData[dst + 3] = alphaOnly ? c0 : 255;
+                    continue;
+                }
+
+                const c1 = data[src++];
+                if (componentCount === 2) {
+                    const luminanceAlpha = !applyGammaCorrection && texture.textureFormat === Constants.TEXTUREFORMAT_LUMINANCE_ALPHA;
+                    normalizedData[dst] = c0;
+                    normalizedData[dst + 1] = luminanceAlpha ? c0 : c1;
+                    normalizedData[dst + 2] = luminanceAlpha ? c0 : 0;
+                    normalizedData[dst + 3] = luminanceAlpha ? c1 : 255;
+                    continue;
+                }
+
+                // RGB data: append an opaque alpha channel.
+                normalizedData[dst] = c0;
+                normalizedData[dst + 1] = c1;
+                normalizedData[dst + 2] = data[src++];
+                normalizedData[dst + 3] = 255;
+            }
+
+            return normalizedData;
+        }
+    }
+
+    return data;
+}
+
+/**
+ * Class used to host texture specific utilities
+ */
+export const TextureTools = {
+    /**
+     * Uses the GPU to create a copy texture rescaled at a given size
+     * @param texture Texture to copy from
+     * @param width defines the desired width
+     * @param height defines the desired height
+     * @param useBilinearMode defines if bilinear mode has to be used
+     * @returns the generated texture
+     */
+    CreateResizedCopy,
+
+    /**
+     * Apply a post process to a texture
+     * @param postProcessName name of the fragment post process
+     * @param internalTexture the texture to encode
+     * @param scene the scene hosting the texture
+     * @param type type of the output texture. If not provided, use the one from internalTexture
+     * @param samplingMode sampling mode to use to sample the source texture. If not provided, use the one from internalTexture
+     * @param format format of the output texture. If not provided, use the one from internalTexture
+     * @returns a promise with the internalTexture having its texture replaced by the result of the processing
+     */
+    ApplyPostProcess,
+    /**
+     * Converts a number to half float
+     * @param value number to convert
+     * @returns converted number
+     */
+    ToHalfFloat,
+
+    /**
+     * Converts a half float to a number
+     * @param value half float to convert
+     * @returns converted half float
+     */
+    FromHalfFloat,
+
+    /**
+     * Gets the data of the specified texture by rendering it to an intermediate RGBA texture and retrieving the bytes from it.
+     * This is convienent to get 8-bit RGBA values for a texture in a GPU compressed format.
+     * @param texture the source texture
+     * @param width the width of the result, which does not have to match the source texture width
+     * @param height the height of the result, which does not have to match the source texture height
+     * @param face if the texture has multiple faces, the face index to use for the source
+     * @param lod if the texture has multiple LODs, the lod index to use for the source
+     * @returns the 8-bit texture data
+     */
+    GetTextureDataAsync,
+};

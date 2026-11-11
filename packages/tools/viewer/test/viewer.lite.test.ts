@@ -1,0 +1,1379 @@
+import { test, expect, Page } from "@playwright/test";
+import { getGlobalConfig } from "@tools/test-tools";
+import type { ViewerElement } from "viewer/lite/viewerElement";
+
+// if running in the CI we need to use the babylon snapshot when loading the tools
+const snapshot = process.env.SNAPSHOT ? "?snapshot=" + process.env.SNAPSHOT : "";
+const cdnPort = ":" + (process.env.CDN_PORT || 1337);
+const viewerUrl =
+    (process.env.VIEWER_BASE_URL || getGlobalConfig().baseUrl.replace(cdnPort, process.env.VIEWER_PORT || ":1342")) +
+    "/packages/tools/viewer/test/apps/web/test-lite.html" +
+    snapshot;
+
+let pageErrors: Error[];
+let consoleErrors: string[];
+let expectConsoleErrors = false;
+
+test.beforeEach(({ page }) => {
+    pageErrors = [];
+    consoleErrors = [];
+    expectConsoleErrors = false;
+
+    page.on("pageerror", (error) => {
+        pageErrors.push(error);
+    });
+
+    page.on("console", (message) => {
+        console.log(`[browser] ${message.text()}`);
+        if (message.type() === "error" || message.type() === "warning") {
+            const text = message.text();
+            // Only capture messages from Babylon.js (prefixed with "BJS -").
+            if (text.includes("BJS -")) {
+                consoleErrors.push(text);
+            }
+        }
+    });
+});
+
+test.afterEach(async ({ page }) => {
+    // Wait until at least 50 frames have been rendered to allow async errors (e.g. WebGPU validation) to surface.
+    // Lite has no engine frame counter, so we count frames via the viewer's onAfterRenderObservable.
+    const actualFrameCount = await waitForFrameCount(page, 50);
+    console.log(`${actualFrameCount} of minimum 50 frames rendered.`);
+    expect(actualFrameCount).toBeGreaterThanOrEqual(50);
+    expect(pageErrors, "Unhandled page errors").toEqual([]);
+    if (!expectConsoleErrors) {
+        expect(consoleErrors, "Console errors").toEqual([]);
+    }
+});
+
+/**
+ * Installs the rendered-frame counter on the viewer (idempotent), waiting for the viewer to exist first.
+ * Call this explicitly before asserting that frames are *not* advancing: until the counter is installed
+ * {@link getFrameCount} reports 0 regardless of what the viewer is doing, which would make such an
+ * assertion pass vacuously.
+ */
+async function attachFrameCounter(page: Page) {
+    await page.waitForFunction(() => {
+        const viewer = (document.querySelector("babylon-viewer") as ViewerElement)?.viewer;
+        if (!viewer) {
+            return false;
+        }
+        const w = window as unknown as { __liteFrameCount?: number; __liteFrameObserverAttached?: boolean };
+        if (!w.__liteFrameObserverAttached) {
+            w.__liteFrameCount = 0;
+            viewer.onAfterRenderObservable.add(() => {
+                w.__liteFrameCount = (w.__liteFrameCount ?? 0) + 1;
+            });
+            w.__liteFrameObserverAttached = true;
+        }
+        return true;
+    });
+}
+
+async function waitForFrameCount(page: Page, minFrameCount: number): Promise<number> {
+    await attachFrameCounter(page);
+
+    const frameCountHandle = await page.waitForFunction((minFrameCount) => {
+        const w = window as unknown as { __liteFrameCount?: number };
+        return (w.__liteFrameCount ?? 0) >= minFrameCount ? w.__liteFrameCount : null;
+    }, minFrameCount);
+
+    return (await frameCountHandle.jsonValue()) as number;
+}
+
+async function waitForModelLoaded(page: Page) {
+    await page.waitForFunction(() => {
+        const element = document.querySelector("babylon-viewer") as ViewerElement;
+        return element.viewer != null && element.viewer.loadingProgress === false && element.viewer.isModelLoaded;
+    });
+    console.log("Model loaded.");
+}
+
+/**
+ * Waits until the viewer exists and no load (model or environment) is in flight. Unlike
+ * {@link waitForModelLoaded}, this does NOT require a model to be present, so it also works for
+ * environment-only scenes and for the model-cleared state.
+ */
+async function waitForLoadingComplete(page: Page) {
+    await page.waitForFunction(() => {
+        const viewer = (document.querySelector("babylon-viewer") as ViewerElement).viewer;
+        return viewer != null && viewer.loadingProgress === false;
+    });
+}
+
+/**
+ * Waits until no camera interpolation is in flight. `resetCamera()` (and hotspot focus) animate the
+ * camera over many frames toward the goal pose (exponential ease at factor 0.1, so full convergence can
+ * take ~60+ frames — more than the fixed frame burst below). The viewer holds an abort handle for the
+ * active interpolation and clears it on completion, so poll that: without this the screenshot can be
+ * captured mid-animation, producing a slightly-off framing and a flaky diff.
+ */
+async function waitForCameraSettled(page: Page) {
+    await page.waitForFunction(() => {
+        const element = document.querySelector("babylon-viewer") as ViewerElement | null;
+        const viewer = element?.viewer as unknown as { _cameraInterpolationAbort: unknown } | null | undefined;
+        return viewer != null && viewer._cameraInterpolationAbort === null;
+    });
+}
+
+async function expectScreenshotMatch(page: Page, name: string, maxDiffPixelRatio = 0.011) {
+    // Lite renders continuously while visible (offscreen suspension aside, there is no idle suspension), so
+    // "settled" is approximated by: no load in flight, no camera interpolation in flight, then a fixed burst
+    // of rendered frames to let deferred GPU work (skybox/ground builders, shadow map, material swaps) drain
+    // into a stable image. This intentionally does NOT require a model (environment-only and model-cleared
+    // scenes have none).
+    await waitForLoadingComplete(page);
+    await waitForCameraSettled(page);
+    const before = await waitForFrameCount(page, 1);
+    await waitForFrameCount(page, before + 30);
+
+    // Lite and the full viewer share the SAME committed reference images, and now that Lite renders the
+    // viewer's default "neutral" tone mapping (matching full) these can use the full viewer's per-pixel
+    // `threshold` (0.035). Most scenes match within the full viewer's `maxDiffPixelRatio` (0.011). A few
+    // still exceed it for genuine renderer differences (not tone mapping): a small residual PBR/AA delta on
+    // a large lit surface (e.g. the zoomed boombox), and high-frequency sampling noise on fine textures
+    // (e.g. the shoe's woven mesh upper). Those callers pass a looser per-test `maxDiffPixelRatio`; the
+    // check still catches pose errors, missing/wrong geometry, and other gross regressions.
+    await expect(page.locator("babylon-viewer")).toHaveScreenshot(name, {
+        threshold: 0.035,
+        maxDiffPixelRatio,
+    });
+}
+
+async function attachViewerElement(page: Page, viewerHtml: string) {
+    await page.goto(viewerUrl, {
+        waitUntil: "load",
+    });
+
+    await page.evaluate((viewerHtml) => {
+        const container = document.createElement("div");
+        container.innerHTML = viewerHtml;
+        document.body.appendChild(container);
+    }, viewerHtml);
+
+    const viewerElementLocator = page.locator("babylon-viewer");
+    await viewerElementLocator.waitFor();
+    const viewerElementHandle = await viewerElementLocator.elementHandle();
+
+    // Wait for the viewer instance to be available and loading to finish.
+    await page.waitForFunction((viewerElement) => {
+        const viewer = viewerElement && (viewerElement as ViewerElement).viewer;
+        return viewer != null && viewer.loadingProgress === false;
+    }, viewerElementHandle);
+
+    // viewerElementHandle cannot be null at this point since we already waited for it to become valid above.
+    return viewerElementHandle!;
+}
+
+// ============================================================
+// These tests mirror the full viewer's viewer.test.ts and are kept in the SAME order for easy
+// side-by-side comparison. Test code is Lite-idiomatic: the full viewer reads state via
+// `element.viewerDetails.viewer`, while Lite exposes it directly as `element.viewer` (Lite has no
+// `viewerDetails`). Screenshot tests validate against the SAME committed reference images as the full
+// viewer (see expectScreenshotMatch for the shared-reference tolerance rationale).
+// ============================================================
+
+test("viewer available", async ({ page }) => {
+    const viewerElementHandle = await attachViewerElement(
+        page,
+        `
+        <babylon-viewer>
+        </babylon-viewer>
+        `
+    );
+
+    const hasViewer = await page.waitForFunction((viewerElement) => {
+        return (viewerElement as ViewerElement).viewer != null;
+    }, viewerElementHandle);
+
+    expect(await hasViewer.jsonValue()).toBe(true);
+});
+
+test("animation-auto-play", async ({ page }) => {
+    const viewerElementHandle = await attachViewerElement(
+        page,
+        `
+        <babylon-viewer
+            source="https://assets.babylonjs.com/meshes/ufo.glb"
+            animation-auto-play
+        >
+        </babylon-viewer>
+        `
+    );
+
+    await waitForModelLoaded(page);
+
+    const isAnimationPlaying = await page.waitForFunction((viewerElement) => {
+        return (viewerElement as ViewerElement).viewer?.isAnimationPlaying;
+    }, viewerElementHandle);
+
+    expect(await isAnimationPlaying.jsonValue()).toBeTruthy();
+});
+
+test('selected-animation="n"', async ({ page }) => {
+    const viewerElementHandle = await attachViewerElement(
+        page,
+        `
+        <babylon-viewer
+            source="https://assets.babylonjs.com/meshes/ufo.glb"
+            selected-animation="1"
+        >
+        </babylon-viewer>
+        `
+    );
+
+    await waitForModelLoaded(page);
+
+    const selectedAnimation = await page.waitForFunction((viewerElement) => {
+        const viewer = (viewerElement as ViewerElement).viewer;
+        return viewer?.isModelLoaded ? viewer.selectedAnimation : undefined;
+    }, viewerElementHandle);
+
+    expect(await selectedAnimation.jsonValue()).toEqual(1);
+});
+
+// This validates against the SAME committed reference image (viewer-camera-orbit.png) as the full
+// viewer's `camera-orbit="a b r"` test. Separate, Lite-idiomatic test code; shared baseline.
+test('camera-orbit="a b r"', async ({ page }) => {
+    await attachViewerElement(
+        page,
+        `
+        <babylon-viewer
+            source="https://assets.babylonjs.com/meshes/boombox.glb"
+            camera-orbit=" 1 2 0.1 "
+        >
+        </babylon-viewer>
+        `
+    );
+
+    // Close-up (radius 0.1) framing of the boombox fills most of the frame, so a small residual PBR/AA
+    // delta between the Lite and full-viewer renderers covers a slightly larger pixel fraction here.
+    await expectScreenshotMatch(page, "viewer-camera-orbit.png", 0.03);
+});
+
+test('camera-target="x y z"', async ({ page }) => {
+    const viewerElementHandle = await attachViewerElement(
+        page,
+        `
+        <babylon-viewer
+            source="https://assets.babylonjs.com/meshes/boombox.glb"
+            camera-target=" 1 2 3 "
+        >
+        </babylon-viewer>
+        `
+    );
+
+    // Lite has no public camera accessor on the element, so read the internal camera target directly.
+    const cameraTarget = await page.waitForFunction((viewerElement) => {
+        const viewer = (viewerElement as ViewerElement).viewer as unknown as { _camera?: { target: { x: number; y: number; z: number } }; isModelLoaded: boolean } | undefined;
+        if (viewer?.isModelLoaded && viewer._camera) {
+            return [viewer._camera.target.x, viewer._camera.target.y, viewer._camera.target.z];
+        }
+        return undefined;
+    }, viewerElementHandle);
+
+    expect(await cameraTarget.jsonValue()).toEqual([1, 2, 3]);
+});
+
+test('material-variant="name"', async ({ page }) => {
+    const viewerElementHandle = await attachViewerElement(
+        page,
+        `
+        <babylon-viewer
+            source="https://assets.babylonjs.com/meshes/shoe_variants.glb"
+            material-variant="street"
+        >
+        </babylon-viewer>
+        `
+    );
+
+    const materialVariant = await page.waitForFunction((viewerElement) => {
+        const viewer = (viewerElement as ViewerElement).viewer;
+        return viewer?.isModelLoaded ? viewer.selectedMaterialVariant : undefined;
+    }, viewerElementHandle);
+
+    expect(await materialVariant.jsonValue()).toEqual("street");
+
+    // The shoe's woven mesh upper is fine high-frequency texture that samples slightly differently between
+    // Lite and the full viewer, so a small fraction of pixels differ (not tone mapping / geometry).
+    await expectScreenshotMatch(page, "viewer-material-variant.png", 0.11);
+});
+
+test("load model from URL", async ({ page }) => {
+    await attachViewerElement(
+        page,
+        `
+        <babylon-viewer
+            source="https://assets.babylonjs.com/meshes/boombox.glb"
+        >
+        </babylon-viewer>
+        `
+    );
+
+    await waitForModelLoaded(page);
+
+    const hasModel = await page.evaluate(() => {
+        const viewer = (document.querySelector("babylon-viewer") as ViewerElement).viewer;
+        return viewer?.isModelLoaded === true;
+    });
+    expect(hasModel).toBe(true);
+
+    await expectScreenshotMatch(page, "viewer-load-model-url.png");
+});
+
+test("change model source", async ({ page }) => {
+    const viewerElementHandle = await attachViewerElement(
+        page,
+        `
+        <babylon-viewer
+            source="https://assets.babylonjs.com/meshes/boombox.glb"
+        >
+        </babylon-viewer>
+        `
+    );
+
+    await waitForModelLoaded(page);
+
+    // Change source to a different model. Wait for the swap to actually commit before screenshotting:
+    // register a `modelchange` listener for the NEW source before mutating the attribute, then await it.
+    // `onModelChanged` fires only after the swapped model has loaded and its renderables have been built
+    // (Lite Viewer `_loadModelImpl`). `waitForModelLoaded` alone is racy here — right after the attribute
+    // change it can still observe the previously-loaded model and return early.
+    await page.evaluate((viewerElement) => {
+        return new Promise<void>((resolve) => {
+            viewerElement.addEventListener("modelchange", ((e: CustomEvent) => {
+                if (typeof e.detail === "string" && e.detail.includes("shoe_variants.glb")) {
+                    resolve();
+                }
+            }) as EventListener);
+            viewerElement.setAttribute("source", "https://assets.babylonjs.com/meshes/shoe_variants.glb");
+        });
+    }, viewerElementHandle);
+
+    await waitForModelLoaded(page);
+    // The shoe's woven mesh upper is fine high-frequency texture that samples slightly differently between
+    // Lite and the full viewer, so a small fraction of pixels differ (not tone mapping / geometry).
+    await expectScreenshotMatch(page, "viewer-change-model-source.png", 0.11);
+});
+
+test("clear model", async ({ page }) => {
+    const viewerElementHandle = await attachViewerElement(
+        page,
+        `
+        <babylon-viewer
+            source="https://assets.babylonjs.com/meshes/boombox.glb"
+        >
+        </babylon-viewer>
+        `
+    );
+
+    await waitForModelLoaded(page);
+
+    // Clear the model by removing the source attribute.
+    await page.evaluate((viewerElement) => {
+        viewerElement.removeAttribute("source");
+    }, viewerElementHandle);
+
+    // Wait for the model to be cleared.
+    await page.waitForFunction((viewerElement) => {
+        return (viewerElement as ViewerElement).viewer?.isModelLoaded === false;
+    }, viewerElementHandle);
+
+    await expectScreenshotMatch(page, "viewer-clear-model.png");
+});
+
+test("invalid model source fires modelerror", async ({ page }) => {
+    // This test intentionally triggers a model loading error.
+    expectConsoleErrors = true;
+
+    await page.goto(viewerUrl, { waitUntil: "load" });
+
+    const errorFired = await page.evaluate(() => {
+        return new Promise<boolean>((resolve, reject) => {
+            const timeout = setTimeout(() => reject(new Error("modelerror event not fired")), 15000);
+            const container = document.createElement("div");
+            container.innerHTML = '<babylon-viewer source="https://assets.babylonjs.com/meshes/nonexistent_model_12345.glb"></babylon-viewer>';
+            const viewer = container.querySelector("babylon-viewer")!;
+            viewer.addEventListener(
+                "modelerror",
+                () => {
+                    clearTimeout(timeout);
+                    resolve(true);
+                },
+                { once: true }
+            );
+            document.body.appendChild(container);
+        });
+    });
+
+    expect(errorFired).toBe(true);
+});
+
+// ============================================================
+// Environment
+// ============================================================
+
+test("environment lighting with model", async ({ page }) => {
+    await attachViewerElement(
+        page,
+        `
+        <babylon-viewer
+            source="https://assets.babylonjs.com/meshes/boombox.glb"
+            environment-lighting="https://assets.babylonjs.com/environments/environmentSpecular.env"
+        >
+        </babylon-viewer>
+        `
+    );
+
+    await waitForModelLoaded(page);
+    await expectScreenshotMatch(page, "viewer-env-lighting.png");
+});
+
+// Regression test: a model whose PBR pipeline is built BEFORE the environment finishes loading must
+// still be lit once the environment arrives. Lite bakes the environment (IBL) textures into the PBR
+// shaders at build time and `loadEnvironment` only updates `scene._envTextures` + the skybox — it does
+// not rebuild existing PBR groups — so without an explicit relight the model renders black while the
+// skybox still looks correct. The viewer forces a PBR rebuild after an environment load when a model is
+// present (see `_rebuildModelPbrForEnvironment`). Here we make the "model built first" ordering
+// deterministic: load the model with NO environment and render several frames so its pipeline is fully
+// built, THEN add the lighting.
+//
+// The relit result is compared against the same committed reference as the concurrent "environment
+// lighting with model" test, but with a looser tolerance: Lite builds a PBR pipeline slightly
+// differently when it is built WITHOUT an environment and then rebuilt WITH one, versus built with the
+// environment present from the start (the constructor now loads the environment before the model so the
+// common path is exact — see the constructor). The post-hoc relight is therefore a few percent off the
+// reference. That is well within this tolerance while an unlit (black) model — the bug this guards
+// against — differs from the reference by far more, so the test still reliably catches a regression.
+test("environment added after model is built relights the model", async ({ page }) => {
+    const viewerElementHandle = await attachViewerElement(
+        page,
+        `
+        <babylon-viewer
+            source="https://assets.babylonjs.com/meshes/boombox.glb"
+            environment="none"
+        >
+        </babylon-viewer>
+        `
+    );
+
+    await waitForModelLoaded(page);
+    // Render several frames so the model's PBR pipeline is fully built with no environment before we add
+    // one — this is what makes the "model built before environment" ordering deterministic (otherwise the
+    // model's async build can race the environment load and win or lose non-deterministically).
+    const before = await waitForFrameCount(page, 1);
+    await waitForFrameCount(page, before + 30);
+
+    // Add the environment lighting after the model is built, and wait for the load (and the relight it
+    // triggers) to finish: `environmentchange` fires at the end of the environment load, after the model
+    // has been rebuilt for the new lighting.
+    await page.evaluate((viewerElement) => {
+        return new Promise<void>((resolve) => {
+            viewerElement.addEventListener("environmentchange", () => resolve(), { once: true });
+            viewerElement.setAttribute("environment-lighting", "https://assets.babylonjs.com/environments/environmentSpecular.env");
+        });
+    }, viewerElementHandle);
+
+    await expectScreenshotMatch(page, "viewer-env-lighting.png");
+});
+
+test("environment skybox", async ({ page }) => {
+    // Regression test for the previous behavior where requesting a skybox with no lighting loaded threw.
+    // ViewerLite now loads the requested skybox URL as the environment (Lite couples skybox + IBL to one
+    // cubemap).
+    await attachViewerElement(
+        page,
+        `
+        <babylon-viewer
+            source="https://assets.babylonjs.com/meshes/boombox.glb"
+            environment-skybox="https://assets.babylonjs.com/environments/environmentSpecular.env"
+        >
+        </babylon-viewer>
+        `
+    );
+
+    await waitForModelLoaded(page);
+
+    // The skybox path resolved to a URL instead of throwing.
+    const skyboxUrl = await page.evaluate(() => {
+        const viewer = (document.querySelector("babylon-viewer") as ViewerElement).viewer as unknown as { _currentSkyboxUrl: string | null };
+        return viewer._currentSkyboxUrl;
+    });
+    expect(skyboxUrl).toBe("https://assets.babylonjs.com/environments/environmentSpecular.env");
+
+    await expectScreenshotMatch(page, "viewer-env-skybox.png");
+});
+
+test("environment-rotation", async ({ page }) => {
+    await attachViewerElement(
+        page,
+        `
+        <babylon-viewer
+            source="https://assets.babylonjs.com/meshes/boombox.glb"
+            environment="auto"
+            environment-rotation="1.5"
+        >
+        </babylon-viewer>
+        `
+    );
+
+    await waitForModelLoaded(page);
+    const rotation = await page.evaluate(() => {
+        return (document.querySelector("babylon-viewer") as ViewerElement).viewer?.environmentConfig.rotation;
+    });
+    expect(rotation).toBe(1.5);
+    await expectScreenshotMatch(page, "viewer-env-rotation.png");
+});
+
+test("dynamic environment rotation", async ({ page }) => {
+    const viewerElementHandle = await attachViewerElement(
+        page,
+        `
+        <babylon-viewer
+            source="https://assets.babylonjs.com/meshes/boombox.glb"
+            environment="auto"
+        >
+        </babylon-viewer>
+        `
+    );
+
+    await waitForModelLoaded(page);
+    const rotation = await page.evaluate((viewerElement) => {
+        const viewer = (viewerElement as ViewerElement).viewer!;
+        viewer.environmentConfig = { rotation: 1.5 };
+        return viewer.environmentConfig.rotation;
+    }, viewerElementHandle);
+    expect(rotation).toBe(1.5);
+    await expectScreenshotMatch(page, "viewer-env-rotation.png");
+});
+
+test("dynamic environment rotation with lighting only", async ({ page }) => {
+    const viewerElementHandle = await attachViewerElement(
+        page,
+        `
+        <babylon-viewer
+            source="https://assets.babylonjs.com/meshes/boombox.glb"
+            environment-lighting="https://assets.babylonjs.com/environments/environmentSpecular.env"
+        >
+        </babylon-viewer>
+        `
+    );
+
+    await waitForModelLoaded(page);
+    await page.evaluate((viewerElement) => {
+        (viewerElement as ViewerElement).viewer!.environmentConfig = { rotation: 1.5 };
+    }, viewerElementHandle);
+    const before = await waitForFrameCount(page, 1);
+    await waitForFrameCount(page, before + 2);
+
+    const rotation = await page.evaluate((viewerElement) => {
+        const viewer = (viewerElement as ViewerElement).viewer as unknown as {
+            _scene: { _environmentRotation?: number; _frameGraph: { _tasks: { _suData?: Float32Array }[] } };
+        };
+        return {
+            scene: viewer._scene._environmentRotation,
+            ubo: viewer._scene._frameGraph._tasks.find((task) => task._suData)?._suData?.[36],
+        };
+    }, viewerElementHandle);
+    expect(rotation.scene).toBe(1.5);
+    expect(rotation.ubo).toBe(1.5);
+});
+
+test("dynamic environment rotation rotates the shadow light", async ({ page }) => {
+    const viewerElementHandle = await attachViewerElement(
+        page,
+        `
+        <babylon-viewer
+            source="https://assets.babylonjs.com/meshes/boombox.glb"
+            environment="auto"
+            shadow-quality="normal"
+        >
+        </babylon-viewer>
+        `
+    );
+
+    await waitForModelLoaded(page);
+    const directions = await page.evaluate((viewerElement) => {
+        const viewer = (viewerElement as ViewerElement).viewer as unknown as {
+            environmentConfig: { rotation: number };
+            _shadowLight: { direction: { x: number; y: number; z: number } } | null;
+        };
+        const light = viewer._shadowLight;
+        if (!light) {
+            return null;
+        }
+
+        const before = [light.direction.x, light.direction.y, light.direction.z];
+        viewer.environmentConfig = { rotation: Math.PI / 2 };
+        const after = [light.direction.x, light.direction.y, light.direction.z];
+        return { before, after };
+    }, viewerElementHandle);
+
+    expect(directions).not.toBeNull();
+    expect(directions!.after[0]).toBeCloseTo(-directions!.before[2]);
+    expect(directions!.after[1]).toBeCloseTo(directions!.before[1]);
+    expect(directions!.after[2]).toBeCloseTo(directions!.before[0]);
+});
+
+test("skybox-blur", async ({ page }) => {
+    await attachViewerElement(
+        page,
+        `
+        <babylon-viewer
+            source="https://assets.babylonjs.com/meshes/boombox.glb"
+            environment-skybox="https://assets.babylonjs.com/environments/environmentSpecular.env"
+            skybox-blur="0.8"
+        >
+        </babylon-viewer>
+        `
+    );
+
+    await waitForModelLoaded(page);
+    await expectScreenshotMatch(page, "viewer-skybox-blur.png");
+});
+
+test("dynamic skybox blur", async ({ page }) => {
+    const viewerElementHandle = await attachViewerElement(
+        page,
+        `
+        <babylon-viewer
+            source="https://assets.babylonjs.com/meshes/boombox.glb"
+            environment-skybox="https://assets.babylonjs.com/environments/environmentSpecular.env"
+            skybox-blur="0"
+        >
+        </babylon-viewer>
+        `
+    );
+
+    await waitForModelLoaded(page);
+    const blur = await page.evaluate((viewerElement) => {
+        const viewer = (viewerElement as ViewerElement).viewer!;
+        viewer.environmentConfig = { blur: 0.8 };
+        return viewer.environmentConfig.blur;
+    }, viewerElementHandle);
+    expect(blur).toBe(0.8);
+    await expectScreenshotMatch(page, "viewer-skybox-blur.png");
+});
+
+// ============================================================
+// Camera
+// ============================================================
+
+test("camera-auto-orbit", async ({ page }) => {
+    const viewerElementHandle = await attachViewerElement(
+        page,
+        `
+        <babylon-viewer
+            source="https://assets.babylonjs.com/meshes/boombox.glb"
+            camera-auto-orbit
+            camera-auto-orbit-speed="0.1"
+            camera-auto-orbit-delay="500"
+        >
+        </babylon-viewer>
+        `
+    );
+
+    await waitForModelLoaded(page);
+
+    const autoOrbit = await page.evaluate((viewerElement) => {
+        const viewer = (viewerElement as ViewerElement).viewer;
+        return {
+            enabled: viewer?.cameraAutoOrbit.enabled,
+            speed: viewer?.cameraAutoOrbit.speed,
+            delay: viewer?.cameraAutoOrbit.delay,
+        };
+    }, viewerElementHandle);
+
+    expect(autoOrbit.enabled).toBe(true);
+    expect(autoOrbit.speed).toBe(0.1);
+    expect(autoOrbit.delay).toBe(500);
+});
+
+test("focusHotSpot handles string camera orbits while auto-orbit is active", async ({ page }) => {
+    const viewerElementHandle = await attachViewerElement(
+        page,
+        `
+        <babylon-viewer
+            source="https://assets.babylonjs.com/meshes/flightHelmet.glb"
+            camera-auto-orbit
+            hotspots='{
+                "Plaque": {
+                    "type": "surface",
+                    "meshIndex": 7,
+                    "pointIndex": [8576, 8561, 8565],
+                    "barycentric": ["0.538", "0.007", "0.455"],
+                    "cameraOrbit": ["1.625", "1.540", "12.615"]
+                },
+                "Plug": {
+                    "type": "surface",
+                    "meshIndex": 7,
+                    "pointIndex": [8627, 8624, 8744],
+                    "barycentric": ["0.550", "0.172", "0.278"],
+                    "cameraOrbit": ["4.108", "1.350", "8.581"]
+                }
+            }'
+        >
+        </babylon-viewer>
+        `
+    );
+
+    await waitForModelLoaded(page);
+
+    const cameraPoses = await page.evaluate(async (viewerElement) => {
+        const viewer = (viewerElement as ViewerElement).viewer!;
+        const viewerInternals = viewer as unknown as {
+            _camera: { alpha: number; beta: number; radius: number; target: { x: number; y: number; z: number } };
+            _cameraInterpolationAbort: AbortController | null;
+        };
+        const poses = [];
+
+        for (const name of ["Plaque", "Plug"]) {
+            viewer.cameraAutoOrbit = { enabled: true, speed: 0.5, delay: 0 };
+            const focused = viewer.focusHotSpot(name);
+            const timeout = performance.now() + 5000;
+            while (viewerInternals._cameraInterpolationAbort !== null && performance.now() < timeout) {
+                await new Promise((resolve) => setTimeout(resolve, 16));
+            }
+            viewer.cameraAutoOrbit = { enabled: false };
+
+            const camera = viewerInternals._camera;
+            poses.push({
+                focused,
+                settled: viewerInternals._cameraInterpolationAbort === null,
+                alpha: camera.alpha,
+                beta: camera.beta,
+                radius: camera.radius,
+                target: [camera.target.x, camera.target.y, camera.target.z],
+            });
+        }
+
+        return poses;
+    }, viewerElementHandle);
+
+    expect(cameraPoses).toHaveLength(2);
+    expect(cameraPoses[0]).toMatchObject({ focused: true, settled: true });
+    expect(cameraPoses[0].alpha).toBeCloseTo(1.625, 1);
+    expect(cameraPoses[0].beta).toBeCloseTo(1.54, 2);
+    expect(cameraPoses[0].radius).toBeCloseTo(12.615, 2);
+    expect(cameraPoses[1]).toMatchObject({ focused: true, settled: true });
+    expect(cameraPoses[1].alpha).toBeCloseTo(4.108, 1);
+    expect(cameraPoses[1].beta).toBeCloseTo(1.35, 2);
+    expect(cameraPoses[1].radius).toBeCloseTo(8.581, 2);
+
+    for (const pose of cameraPoses) {
+        expect([pose.alpha, pose.beta, pose.radius, ...pose.target].every((value) => typeof value === "number" && Number.isFinite(value))).toBe(true);
+    }
+});
+
+test("focusHotSpot preserves omitted camera orbit components", async ({ page }) => {
+    const viewerElementHandle = await attachViewerElement(
+        page,
+        `
+        <babylon-viewer
+            source="https://assets.babylonjs.com/meshes/flightHelmet.glb"
+            hotspots='{
+                "Plaque": {
+                    "type": "surface",
+                    "meshIndex": 7,
+                    "pointIndex": [8576, 8561, 8565],
+                    "barycentric": ["0.538", "0.007", "0.455"]
+                }
+            }'
+        >
+        </babylon-viewer>
+        `
+    );
+
+    await waitForModelLoaded(page);
+
+    const result = await page.evaluate(async (viewerElement) => {
+        const viewer = (viewerElement as ViewerElement).viewer!;
+        const viewerInternals = viewer as unknown as {
+            _camera: { alpha: number; beta: number; radius: number };
+            _cameraInterpolationAbort: AbortController | null;
+        };
+        const camera = viewerInternals._camera;
+        camera.alpha = 0.7;
+        camera.beta = 1.1;
+        camera.radius = 9;
+
+        const focused = viewer.focusHotSpot("Plaque");
+        const timeout = performance.now() + 5000;
+        while (viewerInternals._cameraInterpolationAbort !== null && performance.now() < timeout) {
+            await new Promise((resolve) => setTimeout(resolve, 16));
+        }
+
+        return {
+            focused,
+            settled: viewerInternals._cameraInterpolationAbort === null,
+            alpha: camera.alpha,
+            beta: camera.beta,
+            radius: camera.radius,
+        };
+    }, viewerElementHandle);
+
+    expect(result).toMatchObject({
+        focused: true,
+        settled: true,
+        alpha: 0.7,
+        beta: 1.1,
+        radius: 9,
+    });
+});
+
+test("resetCamera()", async ({ page }) => {
+    const viewerElementHandle = await attachViewerElement(
+        page,
+        `
+        <babylon-viewer
+            source="https://assets.babylonjs.com/meshes/boombox.glb"
+            camera-orbit="2 auto auto"
+        >
+        </babylon-viewer>
+        `
+    );
+
+    await waitForModelLoaded(page);
+
+    // Reset the camera.
+    await page.evaluate((viewerElement) => {
+        (viewerElement as ViewerElement).resetCamera();
+    }, viewerElementHandle);
+
+    await expectScreenshotMatch(page, "viewer-reset-camera.png");
+});
+
+// ============================================================
+// Material Variants
+// ============================================================
+
+test("materialVariants list", async ({ page }) => {
+    const viewerElementHandle = await attachViewerElement(
+        page,
+        `
+        <babylon-viewer
+            source="https://assets.babylonjs.com/meshes/shoe_variants.glb"
+        >
+        </babylon-viewer>
+        `
+    );
+
+    await waitForModelLoaded(page);
+
+    const variants = await page.evaluate((viewerElement) => {
+        return [...((viewerElement as ViewerElement).viewer?.materialVariants ?? [])];
+    }, viewerElementHandle);
+
+    expect(variants.length).toBeGreaterThan(0);
+    expect(variants).toContain("street");
+});
+
+test("change material variant dynamically", async ({ page }) => {
+    const viewerElementHandle = await attachViewerElement(
+        page,
+        `
+        <babylon-viewer
+            source="https://assets.babylonjs.com/meshes/shoe_variants.glb"
+            material-variant="street"
+        >
+        </babylon-viewer>
+        `
+    );
+
+    await waitForModelLoaded(page);
+
+    // Get available variants and switch to a different one.
+    const newVariant = await page.evaluate((viewerElement) => {
+        const viewer = (viewerElement as ViewerElement).viewer;
+        if (viewer) {
+            const variants = viewer.materialVariants;
+            const other = variants.find((v) => v !== "street");
+            if (other) {
+                viewer.selectedMaterialVariant = other;
+                return other;
+            }
+        }
+        return null;
+    }, viewerElementHandle);
+
+    expect(newVariant).not.toBeNull();
+
+    await expectScreenshotMatch(page, "viewer-material-variant-changed.png");
+});
+
+// ============================================================
+// Clear Color
+// ============================================================
+
+test('clear-color="red"', async ({ page }) => {
+    await attachViewerElement(
+        page,
+        `
+        <babylon-viewer
+            source="https://assets.babylonjs.com/meshes/boombox.glb"
+            clear-color="red"
+        >
+        </babylon-viewer>
+        `
+    );
+
+    await waitForModelLoaded(page);
+    await expectScreenshotMatch(page, "viewer-clear-color-red.png");
+});
+
+// ============================================================
+// Animations
+// ============================================================
+
+test("toggleAnimation()", async ({ page }) => {
+    const viewerElementHandle = await attachViewerElement(
+        page,
+        `
+        <babylon-viewer
+            source="https://assets.babylonjs.com/meshes/ufo.glb"
+        >
+        </babylon-viewer>
+        `
+    );
+
+    await waitForModelLoaded(page);
+
+    // Initially animation should not be playing.
+    const initiallyPlaying = await page.evaluate((viewerElement) => {
+        return (viewerElement as ViewerElement).viewer?.isAnimationPlaying;
+    }, viewerElementHandle);
+    expect(initiallyPlaying).toBe(false);
+
+    // Toggle animation on.
+    await page.evaluate((viewerElement) => {
+        (viewerElement as ViewerElement).toggleAnimation();
+    }, viewerElementHandle);
+
+    const isPlayingAfterToggle = await page.evaluate((viewerElement) => {
+        return (viewerElement as ViewerElement).viewer?.isAnimationPlaying;
+    }, viewerElementHandle);
+    expect(isPlayingAfterToggle).toBe(true);
+
+    // Toggle animation off.
+    await page.evaluate((viewerElement) => {
+        (viewerElement as ViewerElement).toggleAnimation();
+    }, viewerElementHandle);
+
+    await page.waitForFunction((viewerElement) => {
+        return !(viewerElement as ViewerElement).viewer?.isAnimationPlaying;
+    }, viewerElementHandle);
+});
+
+test("animation speed", async ({ page }) => {
+    const viewerElementHandle = await attachViewerElement(
+        page,
+        `
+        <babylon-viewer
+            source="https://assets.babylonjs.com/meshes/ufo.glb"
+            animation-speed="2"
+        >
+        </babylon-viewer>
+        `
+    );
+
+    await waitForModelLoaded(page);
+
+    const speed = await page.evaluate((viewerElement) => {
+        return (viewerElement as ViewerElement).viewer?.animationSpeed;
+    }, viewerElementHandle);
+    expect(speed).toBe(2);
+});
+
+test("animations list", async ({ page }) => {
+    const viewerElementHandle = await attachViewerElement(
+        page,
+        `
+        <babylon-viewer
+            source="https://assets.babylonjs.com/meshes/ufo.glb"
+        >
+        </babylon-viewer>
+        `
+    );
+
+    await waitForModelLoaded(page);
+
+    const animations = await page.evaluate((viewerElement) => {
+        return [...((viewerElement as ViewerElement).viewer?.animations ?? [])];
+    }, viewerElementHandle);
+
+    expect(animations.length).toBeGreaterThan(0);
+});
+
+// ============================================================
+// Events
+// ============================================================
+
+test("viewerready event", async ({ page }) => {
+    await page.goto(viewerUrl, { waitUntil: "load" });
+
+    const readyPromise = page.evaluate(() => {
+        return new Promise<boolean>((resolve) => {
+            const container = document.createElement("div");
+            container.innerHTML = "<babylon-viewer></babylon-viewer>";
+            const viewer = container.querySelector("babylon-viewer")!;
+            viewer.addEventListener("viewerready", () => resolve(true), { once: true });
+            document.body.appendChild(container);
+        });
+    });
+
+    expect(await readyPromise).toBe(true);
+});
+
+test("modelchange event", async ({ page }) => {
+    await page.goto(viewerUrl, { waitUntil: "load" });
+
+    const modelChangePromise = page.evaluate(() => {
+        return new Promise<string | null>((resolve) => {
+            const container = document.createElement("div");
+            container.innerHTML = '<babylon-viewer source="https://assets.babylonjs.com/meshes/boombox.glb"></babylon-viewer>';
+            const viewer = container.querySelector("babylon-viewer")!;
+            viewer.addEventListener("modelchange", ((e: CustomEvent) => resolve(e.detail)) as EventListener, { once: true });
+            document.body.appendChild(container);
+        });
+    });
+
+    const detail = await modelChangePromise;
+    expect(detail).toContain("boombox.glb");
+});
+
+test("selectedanimationchange event", async ({ page }) => {
+    const viewerElementHandle = await attachViewerElement(
+        page,
+        `
+        <babylon-viewer
+            source="https://assets.babylonjs.com/meshes/ufo.glb"
+        >
+        </babylon-viewer>
+        `
+    );
+
+    await waitForModelLoaded(page);
+
+    const eventFired = await page.evaluate((viewerElement) => {
+        return new Promise<boolean>((resolve) => {
+            viewerElement.addEventListener("selectedanimationchange", () => resolve(true), { once: true });
+            (viewerElement as ViewerElement).selectedAnimation = 1;
+        });
+    }, viewerElementHandle);
+
+    expect(eventFired).toBe(true);
+});
+
+test("animationplayingchange event", async ({ page }) => {
+    const viewerElementHandle = await attachViewerElement(
+        page,
+        `
+        <babylon-viewer
+            source="https://assets.babylonjs.com/meshes/ufo.glb"
+        >
+        </babylon-viewer>
+        `
+    );
+
+    await waitForModelLoaded(page);
+
+    const eventFired = await page.evaluate((viewerElement) => {
+        return new Promise<boolean>((resolve) => {
+            viewerElement.addEventListener("animationplayingchange", () => resolve(true), { once: true });
+            (viewerElement as ViewerElement).toggleAnimation();
+        });
+    }, viewerElementHandle);
+
+    expect(eventFired).toBe(true);
+});
+
+// ============================================================
+// Element Lifecycle
+// ============================================================
+
+test("element removal and re-addition", async ({ page }) => {
+    const viewerElementHandle = await attachViewerElement(
+        page,
+        `
+        <babylon-viewer
+            source="https://assets.babylonjs.com/meshes/boombox.glb"
+        >
+        </babylon-viewer>
+        `
+    );
+
+    await waitForModelLoaded(page);
+
+    // Remove the element from the DOM.
+    await page.evaluate((viewerElement) => {
+        viewerElement.remove();
+    }, viewerElementHandle);
+
+    // Wait a moment for cleanup.
+    await page.waitForTimeout(500);
+
+    // Re-add a new viewer element.
+    await page.evaluate(() => {
+        const container = document.createElement("div");
+        container.innerHTML = '<babylon-viewer source="https://assets.babylonjs.com/meshes/boombox.glb"></babylon-viewer>';
+        document.body.appendChild(container);
+    });
+
+    // Wait for the new element to be ready.
+    await page.waitForFunction(() => {
+        const viewer = (document.querySelector("babylon-viewer") as ViewerElement)?.viewer;
+        return viewer != null && viewer.loadingProgress === false && viewer.isModelLoaded;
+    });
+
+    await expectScreenshotMatch(page, "viewer-re-added.png");
+});
+
+test("reload()", async ({ page }) => {
+    const viewerElementHandle = await attachViewerElement(
+        page,
+        `
+        <babylon-viewer
+            source="https://assets.babylonjs.com/meshes/boombox.glb"
+        >
+        </babylon-viewer>
+        `
+    );
+
+    await waitForModelLoaded(page);
+
+    // Call reload.
+    await page.evaluate((viewerElement) => {
+        (viewerElement as ViewerElement).reload();
+    }, viewerElementHandle);
+
+    // Wait for the viewer to reinitialize.
+    await page.waitForFunction((viewerElement) => {
+        const viewer = (viewerElement as ViewerElement).viewer;
+        return viewer != null && viewer.loadingProgress === false && viewer.isModelLoaded;
+    }, viewerElementHandle);
+
+    await expectScreenshotMatch(page, "viewer-reload.png");
+});
+
+// ============================================================
+// Reset Behavior
+// ============================================================
+
+test("reset() restores initial state", async ({ page }) => {
+    const viewerElementHandle = await attachViewerElement(
+        page,
+        `
+        <babylon-viewer
+            source="https://assets.babylonjs.com/meshes/boombox.glb"
+        >
+        </babylon-viewer>
+        `
+    );
+
+    await waitForModelLoaded(page);
+
+    // Change camera position (zoom all the way in).
+    await page.evaluate((viewerElement) => {
+        (viewerElement as ViewerElement).viewer?.updateCamera({ radius: 0.001 });
+    }, viewerElementHandle);
+
+    // Reset the viewer.
+    await page.evaluate((viewerElement) => {
+        (viewerElement as ViewerElement).reset();
+    }, viewerElementHandle);
+
+    // Wait for reset to complete and the scene to settle.
+    await expectScreenshotMatch(page, "viewer-reset.png");
+});
+
+// ============================================================
+// Offscreen Render Suspension
+// ============================================================
+
+/**
+ * Makes the document scrollable by appending a tall spacer below the viewer, so the viewer can be scrolled
+ * out of the viewport. `test-lite.html` sizes `html`/`body` to 100% with no scrollable content; the spacer
+ * overflows the body, which propagates to the viewport and creates the scroll range. The viewer element is
+ * deliberately left at its inherited (viewport) size so screenshots still match the shared reference images.
+ */
+async function makeViewerScrollable(page: Page) {
+    await page.evaluate(() => {
+        const spacer = document.createElement("div");
+        spacer.style.height = "5000px";
+        document.body.appendChild(spacer);
+    });
+}
+
+/** Scrolls the viewer completely out of the viewport (requires {@link makeViewerScrollable}). */
+async function scrollViewerOffscreen(page: Page) {
+    await page.evaluate(() => window.scrollTo(0, 4000));
+}
+
+/** Scrolls the viewer back into the viewport. */
+async function scrollViewerOnscreen(page: Page) {
+    await page.evaluate(() => window.scrollTo(0, 0));
+}
+
+/**
+ * Waits until the viewer's render loop reaches the expected running state. The `IntersectionObserver` that
+ * drives suspension fires asynchronously after layout, so polling the loop state is more deterministic than
+ * waiting a fixed interval.
+ */
+async function waitForRenderLoopRunning(page: Page, expected: boolean) {
+    await page.waitForFunction((expected) => {
+        const viewer = (document.querySelector("babylon-viewer") as ViewerElement | null)?.viewer as unknown as { _renderLoopRunning: boolean } | undefined;
+        return viewer != null && viewer._renderLoopRunning === expected;
+    }, expected);
+}
+
+/** Reads the current rendered-frame count without waiting for it to advance. */
+async function getFrameCount(page: Page): Promise<number> {
+    return await page.evaluate(() => (window as unknown as { __liteFrameCount?: number }).__liteFrameCount ?? 0);
+}
+
+test("rendering is suspended while the viewer is offscreen", async ({ page }) => {
+    await attachViewerElement(
+        page,
+        `
+        <babylon-viewer
+            source="https://assets.babylonjs.com/meshes/boombox.glb"
+        >
+        </babylon-viewer>
+        `
+    );
+
+    await waitForModelLoaded(page);
+    await makeViewerScrollable(page);
+
+    // Attach the frame counter and confirm frames are advancing while the viewer is visible.
+    const visibleBefore = await waitForFrameCount(page, 1);
+    await waitForFrameCount(page, visibleBefore + 5);
+
+    await scrollViewerOffscreen(page);
+    await waitForRenderLoopRunning(page, false);
+
+    // Sample after a short settle (an in-flight frame may still land as the loop stops), then confirm the
+    // count is genuinely frozen rather than merely slowed.
+    await page.waitForTimeout(200);
+    const suspended = await getFrameCount(page);
+    await page.waitForTimeout(500);
+    expect(await getFrameCount(page), "Frames rendered while offscreen").toBe(suspended);
+
+    // Restore visibility so the shared afterEach frame-count assertion can be satisfied.
+    await scrollViewerOnscreen(page);
+    await waitForRenderLoopRunning(page, true);
+});
+
+test("rendering resumes when the viewer is scrolled back into view", async ({ page }) => {
+    await attachViewerElement(
+        page,
+        `
+        <babylon-viewer
+            source="https://assets.babylonjs.com/meshes/boombox.glb"
+        >
+        </babylon-viewer>
+        `
+    );
+
+    await waitForModelLoaded(page);
+    await makeViewerScrollable(page);
+
+    await scrollViewerOffscreen(page);
+    await waitForRenderLoopRunning(page, false);
+
+    await scrollViewerOnscreen(page);
+    await waitForRenderLoopRunning(page, true);
+
+    // Frames advance again, and the scene still renders correctly after the pause. Validates against the
+    // same reference image as the plain "load model from url" test — suspending and resuming must be
+    // visually transparent.
+    await expectScreenshotMatch(page, "viewer-load-model-url.png");
+});
+
+test("model and environment loaded while offscreen render correctly on resume", async ({ page }) => {
+    // Regression test for the render-loop/scene-registration split: an environment or model loaded while
+    // rendering is suspended must still register its renderables, otherwise the skybox (or the model) would
+    // never appear even after rendering resumes. The viewer is created *below the fold* so it is suspended
+    // essentially from birth — this also covers a viewer that must reach a correct first render on resume.
+    await page.goto(viewerUrl, { waitUntil: "load" });
+
+    await page.evaluate(() => {
+        // Spacer first, so the viewer element lands below the viewport and starts out offscreen.
+        const spacer = document.createElement("div");
+        spacer.style.height = "5000px";
+        document.body.appendChild(spacer);
+
+        const container = document.createElement("div");
+        container.innerHTML = `
+            <babylon-viewer
+                source="https://assets.babylonjs.com/meshes/boombox.glb"
+                environment-skybox="https://assets.babylonjs.com/environments/environmentSpecular.env"
+            >
+            </babylon-viewer>
+            `;
+        document.body.appendChild(container);
+    });
+
+    await page.locator("babylon-viewer").waitFor();
+
+    // Install the frame counter as early as possible, before anything could render, so the assertions below
+    // observe the real absence of rendering rather than an uninitialized counter.
+    await attachFrameCounter(page);
+
+    // The model and environment must load to completion even though the viewer is suspended. The
+    // `IntersectionObserver` fires asynchronously after layout, so a frame or two can land before suspension
+    // engages; the invariant that matters is that rendering does not *continue* while offscreen.
+    await waitForLoadingComplete(page);
+    await waitForRenderLoopRunning(page, false);
+
+    const suspended = await getFrameCount(page);
+    await page.waitForTimeout(500);
+    expect(await getFrameCount(page), "Frames rendered while offscreen").toBe(suspended);
+
+    // Bring the viewer into view: the spacer plus the viewport-sized viewer means max scroll lands the
+    // viewer exactly in the viewport.
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await waitForRenderLoopRunning(page, true);
+    await waitForModelLoaded(page);
+
+    // Same reference image as the `environment-skybox` test: the model and skybox must both be present.
+    await expectScreenshotMatch(page, "viewer-env-skybox.png");
+});
+
+test("disposing a viewer while it is offscreen", async ({ page }) => {
+    const viewerElementHandle = await attachViewerElement(
+        page,
+        `
+        <babylon-viewer
+            source="https://assets.babylonjs.com/meshes/boombox.glb"
+        >
+        </babylon-viewer>
+        `
+    );
+
+    await waitForModelLoaded(page);
+    await makeViewerScrollable(page);
+
+    await scrollViewerOffscreen(page);
+    await waitForRenderLoopRunning(page, false);
+
+    // Dispose the suspended viewer. This must tear down cleanly: the suspension holds the render loop
+    // stopped, so anything still awaiting the loop's first frame has to be released by disposal.
+    await page.evaluate((viewerElement) => {
+        viewerElement.remove();
+    }, viewerElementHandle);
+    await page.waitForTimeout(500);
+
+    // Re-add a visible viewer so the shared afterEach frame-count assertion has something to observe. This
+    // test deliberately never attaches the frame counter before the removal, so it binds to this new viewer.
+    await scrollViewerOnscreen(page);
+    await page.evaluate(() => {
+        const container = document.createElement("div");
+        container.innerHTML = "<babylon-viewer></babylon-viewer>";
+        document.body.prepend(container);
+    });
+
+    await waitForLoadingComplete(page);
+    await waitForRenderLoopRunning(page, true);
+});

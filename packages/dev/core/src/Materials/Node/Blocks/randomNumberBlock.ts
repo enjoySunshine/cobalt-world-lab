@@ -1,0 +1,8 @@
+/**
+ * Re-exports pure implementation and applies runtime side effects.
+ * Import randomNumberBlock.pure for tree-shakeable, side-effect-free usage.
+ */
+export * from "./randomNumberBlock.pure";
+
+import { RegisterRandomNumberBlock } from "./randomNumberBlock.pure";
+RegisterRandomNumberBlock();

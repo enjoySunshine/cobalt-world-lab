@@ -1,0 +1,1591 @@
+import { type Engine, NullEngine } from "core/Engines";
+import { Constants } from "core/Engines/constants";
+import {
+    type FlowGraphAssetType,
+    type FlowGraphExecutionBlock,
+    FlowGraphAddBlock,
+    FlowGraphConstantBlock,
+    FlowGraphCoordinator,
+    FlowGraphGetVariableBlock,
+    FlowGraphInteger,
+    FlowGraphConsoleLogBlock,
+    FlowGraphDivideBlock,
+    FlowGraphMultiGateBlock,
+    FlowGraphMultiplyBlock,
+    FlowGraphPlayAnimationBlock,
+    FlowGraphSceneReadyEventBlock,
+    FlowGraphMeshIntersectionEventBlock,
+    FlowGraphSendCustomEventBlock,
+    FlowGraphReceiveCustomEventBlock,
+    FlowGraphSetPropertyBlock,
+    FlowGraphSubtractBlock,
+    FlowGraphStopAnimationBlock,
+    RichTypeNumber,
+    RichTypeFlowGraphInteger,
+    RichTypeVector3,
+    ParseGraphDataConnection,
+    ParseFlowGraphBlockWithClassType,
+    ParseFlowGraphContext,
+    ParseFlowGraph,
+    ParseFlowGraphAsync,
+    ParseCoordinatorAsync,
+    ParseFlowGraphCoordinatorFromSnippetAsync,
+    ParseFlowGraphFromSnippetAsync,
+} from "core/FlowGraph";
+import { FlowGraphConnectionType } from "core/FlowGraph/flowGraphConnection";
+import { FlowGraphDataConnection } from "core/FlowGraph/flowGraphDataConnection";
+import { FlowGraphEventType } from "core/FlowGraph/flowGraphEventType";
+import { FlowGraphPathConverter } from "core/FlowGraph/flowGraphPathConverter";
+import { defaultValueParseFunction, defaultValueSerializationFunction } from "core/FlowGraph/serialization";
+import { InstancedMesh } from "core/Meshes/instancedMesh";
+import { Vector3 } from "core/Maths";
+import { Mesh } from "core/Meshes";
+import { TransformNode } from "core/Meshes/transformNode";
+import { Logger } from "core/Misc/logger";
+import { Scene } from "core/scene";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ArcRotateCamera } from "core/Cameras/arcRotateCamera";
+
+function MockFlowGraphSnippet(serializedFlowGraph: any) {
+    const fetchMock = vi.fn(async () => {
+        return new Response(JSON.stringify({ jsonPayload: JSON.stringify({ flowGraph: JSON.stringify(serializedFlowGraph) }) }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    return fetchMock;
+}
+
+describe("Flow Graph Serialization", () => {
+    let engine: Engine;
+    let scene: Scene;
+    beforeEach(() => {
+        engine = new NullEngine({
+            renderHeight: 256,
+            renderWidth: 256,
+            textureSize: 256,
+            deterministicLockstep: false,
+            lockstepMaxSteps: 1,
+        });
+        Logger.Log = vi.fn();
+
+        scene = new Scene(engine);
+    });
+
+    afterEach(() => {
+        vi.unstubAllGlobals();
+    });
+    it("Serializes and Parses a connection", () => {
+        const block = {} as any;
+        block.uniqueId = "test";
+        const connection = new FlowGraphDataConnection("test", FlowGraphConnectionType.Input, block, RichTypeNumber);
+        connection.metadata = { source: { socket: "value" } };
+        const serialized: any = {};
+        connection.serialize(serialized);
+
+        expect(serialized.uniqueId).toBeDefined();
+        expect(serialized.name).toEqual("test");
+        expect(serialized._connectionType).toEqual(FlowGraphConnectionType.Input);
+        expect(serialized.connectedPointIds).toEqual([]);
+        expect(serialized.className).toEqual("FlowGraphDataConnection");
+        expect(serialized.richType.typeName).toEqual("number");
+        expect(serialized.richType.defaultValue).toEqual(0);
+        expect(serialized.metadata).toEqual(connection.metadata);
+
+        const parsed = ParseGraphDataConnection(serialized, block, FlowGraphDataConnection);
+        expect(parsed.uniqueId).toEqual(connection.uniqueId);
+        expect(parsed.name).toEqual("test");
+        expect(parsed._connectionType).toEqual(FlowGraphConnectionType.Input);
+        expect(parsed.getClassName()).toEqual("FlowGraphDataConnection");
+        expect(parsed.richType.typeName).toEqual("number");
+        expect(parsed.richType.defaultValue).toEqual(0);
+        expect(parsed.metadata).toEqual(connection.metadata);
+
+        const connection2 = new FlowGraphDataConnection("test2", FlowGraphConnectionType.Output, block, RichTypeNumber);
+        connection.connectTo(connection2);
+
+        const serialized2: any = {};
+        connection.serialize(serialized2);
+
+        expect(serialized2.connectedPointIds[0]).toBe(connection2.uniqueId);
+
+        const parsed2 = ParseGraphDataConnection(serialized2, block, FlowGraphDataConnection);
+        expect(parsed2.connectedPointIds[0]).toBe(connection2.uniqueId);
+
+        // Check if a more complex type is properly serialized and parsed.
+        const connection3 = new FlowGraphDataConnection("test3", FlowGraphConnectionType.Output, block, RichTypeVector3);
+        const serialized3: any = {};
+        connection3.serialize(serialized3);
+        expect(serialized3.richType.typeName).toEqual("Vector3");
+        expect(serialized3.richType.defaultValue._x).toEqual(0);
+        expect(serialized3.richType.defaultValue._y).toEqual(0);
+        expect(serialized3.richType.defaultValue._z).toEqual(0);
+
+        const parsed3 = ParseGraphDataConnection(serialized3, block, FlowGraphDataConnection);
+        expect(parsed3.richType.typeName).toEqual("Vector3");
+        expect(parsed3.richType.defaultValue.x).toEqual(0);
+        expect(parsed3.richType.defaultValue.y).toEqual(0);
+        expect(parsed3.richType.defaultValue.z).toEqual(0);
+    });
+
+    it("preserves prototype-like custom event payload ids as own properties", () => {
+        const emptyReceive = new FlowGraphReceiveCustomEventBlock({ eventId: "event", eventData: {} });
+        const legacySerializedReceive: any = {};
+        emptyReceive.serialize(legacySerializedReceive);
+        legacySerializedReceive.config.eventData = [
+            {
+                eventData: true,
+                id: "__proto__",
+                type: "number",
+                value: { type: "number", value: [5] },
+            },
+        ];
+        const parsedLegacyReceive = ParseFlowGraphBlockWithClassType(legacySerializedReceive, { scene }, FlowGraphReceiveCustomEventBlock) as FlowGraphReceiveCustomEventBlock;
+        const eventData = parsedLegacyReceive.config.eventData;
+        expect(Object.prototype.hasOwnProperty.call(eventData, "__proto__")).toBe(true);
+        Object.defineProperty(eventData, "position", {
+            configurable: true,
+            enumerable: true,
+            value: { type: RichTypeVector3, value: new Vector3(1, 2, 3) },
+            writable: true,
+        });
+
+        const send = new FlowGraphSendCustomEventBlock({ eventId: "event", eventData });
+        const receive = new FlowGraphReceiveCustomEventBlock({ eventId: "event", eventData });
+        expect(send.getDataInput("__proto__")).toBeDefined();
+        expect(receive.getDataOutput("__proto__")).toBeDefined();
+
+        const serialized: any = {};
+        send.serialize(serialized);
+        expect(Object.prototype.hasOwnProperty.call(serialized.config.eventData, "__proto__")).toBe(true);
+
+        const serializedReceive: any = {};
+        receive.serialize(serializedReceive);
+        expect(Object.prototype.hasOwnProperty.call(serializedReceive.config.eventData, "__proto__")).toBe(true);
+        expect(serializedReceive.config.eventData["__proto__"].value).toBe(5);
+        const parsedReceive = ParseFlowGraphBlockWithClassType(serializedReceive, { scene }, FlowGraphReceiveCustomEventBlock) as FlowGraphReceiveCustomEventBlock;
+        expect(parsedReceive.config.eventData.position.value).toEqual(new Vector3(1, 2, 3));
+    });
+
+    it("passes the complete custom event schema to an explicit value parser", () => {
+        const receive = new FlowGraphReceiveCustomEventBlock({
+            eventId: "event",
+            eventData: { score: { type: RichTypeNumber, value: 5 } },
+        });
+        const serialized: any = {};
+        receive.serialize(serialized);
+        const valueParseFunction = vi.fn((key: string, serializationObject: any, assetsContainer: any, parseScene: Scene) => {
+            if (key === "eventData") {
+                return { score: { type: RichTypeNumber, value: 42 } };
+            }
+            return defaultValueParseFunction(key, serializationObject, assetsContainer, parseScene);
+        });
+
+        const parsed = ParseFlowGraphBlockWithClassType(serialized, { scene, valueParseFunction }, FlowGraphReceiveCustomEventBlock) as FlowGraphReceiveCustomEventBlock;
+
+        expect(valueParseFunction).toHaveBeenCalledWith("eventData", serialized.config, scene, scene);
+        expect(parsed.config.eventData.score.value).toBe(42);
+    });
+
+    it("applies scoped event decoding across Send and Receive when an explicit value parser delegates to the default", () => {
+        const eventData = { value: { type: RichTypeNumber, value: 5 } };
+        const send = new FlowGraphSendCustomEventBlock({ eventId: "event", eventData });
+        const receive = new FlowGraphReceiveCustomEventBlock({
+            eventId: "event",
+            eventData,
+        });
+        const valueParseFunction = vi.fn(defaultValueParseFunction);
+        const serializedSend: any = {};
+        send.serialize(serializedSend);
+        const serializedReceive: any = {};
+        receive.serialize(serializedReceive);
+
+        const parsedSend = ParseFlowGraphBlockWithClassType(serializedSend, { scene, valueParseFunction }, FlowGraphSendCustomEventBlock) as FlowGraphSendCustomEventBlock;
+        const parsedReceive = ParseFlowGraphBlockWithClassType(
+            serializedReceive,
+            { scene, valueParseFunction },
+            FlowGraphReceiveCustomEventBlock
+        ) as FlowGraphReceiveCustomEventBlock;
+
+        expect(valueParseFunction).toHaveBeenCalledWith("eventData", serializedSend.config, scene, scene);
+        expect(valueParseFunction).toHaveBeenCalledWith("eventData", serializedReceive.config, scene, scene);
+        expect(parsedSend.getDataInput("value")).toBeDefined();
+        expect(parsedReceive.getDataOutput("value")).toBeDefined();
+        expect(parsedSend.config.eventData.value.value).toBe(5);
+        expect(parsedReceive.config.eventData.value.value).toBe(5);
+    });
+
+    it("applies delegated scoped event decoding to importer-shaped arrays across Send and Receive", () => {
+        const send = new FlowGraphSendCustomEventBlock({ eventId: "event", eventData: {} });
+        const receive = new FlowGraphReceiveCustomEventBlock({ eventId: "event", eventData: {} });
+        const serializedSend: any = {};
+        const serializedReceive: any = {};
+        send.serialize(serializedSend);
+        receive.serialize(serializedReceive);
+        const eventData = [
+            {
+                eventData: true,
+                id: "score",
+                type: "number",
+                value: { type: "number", value: [5] },
+            },
+        ];
+        serializedSend.config.eventData = eventData;
+        serializedReceive.config.eventData = eventData;
+        const valueParseFunction = vi.fn((key: string, serializationObject: any, assetsContainer: any, parseScene: Scene) =>
+            defaultValueParseFunction(key, serializationObject, assetsContainer, parseScene)
+        );
+
+        const parsedSend = ParseFlowGraphBlockWithClassType(serializedSend, { scene, valueParseFunction }, FlowGraphSendCustomEventBlock) as FlowGraphSendCustomEventBlock;
+        const parsedReceive = ParseFlowGraphBlockWithClassType(
+            serializedReceive,
+            { scene, valueParseFunction },
+            FlowGraphReceiveCustomEventBlock
+        ) as FlowGraphReceiveCustomEventBlock;
+
+        expect(parsedSend.getDataInput("score")).toBeDefined();
+        expect(parsedReceive.getDataOutput("score")).toBeDefined();
+        expect(parsedSend.getDataInput("0")).toBeUndefined();
+        expect(parsedReceive.getDataOutput("0")).toBeUndefined();
+        expect(parsedSend.config.eventData.score.value).toBe(5);
+        expect(parsedReceive.config.eventData.score.value).toBe(5);
+    });
+
+    it("preserves a typed default reconstructed by an in-place custom event parser", () => {
+        const receive = new FlowGraphReceiveCustomEventBlock({
+            eventId: "event",
+            eventData: { value: { type: RichTypeFlowGraphInteger, value: new FlowGraphInteger(5) } },
+        });
+        const serialized: any = {};
+        receive.serialize(serialized);
+        const valueParseFunction = vi.fn((key: string, serializationObject: any, assetsContainer: any, parseScene: Scene) => {
+            if (key === "eventData") {
+                serializationObject.eventData.value.type = RichTypeFlowGraphInteger;
+                serializationObject.eventData.value.value = new FlowGraphInteger(5);
+                return serializationObject.eventData;
+            }
+            return defaultValueParseFunction(key, serializationObject, assetsContainer, parseScene);
+        });
+
+        const parsed = ParseFlowGraphBlockWithClassType(serialized, { scene, valueParseFunction }, FlowGraphReceiveCustomEventBlock) as FlowGraphReceiveCustomEventBlock;
+
+        expect(parsed.config.eventData.value.value).toBeInstanceOf(FlowGraphInteger);
+        expect(parsed.config.eventData.value.value.value).toBe(5);
+    });
+
+    it("round-trips Send and Receive custom-event sockets named value through a full graph parse", () => {
+        const coordinator = new FlowGraphCoordinator({ scene });
+        const graph = coordinator.createGraph();
+        const eventData = { value: { type: RichTypeNumber, value: 5 } };
+        const send = new FlowGraphSendCustomEventBlock({ eventId: "event", eventData });
+        const receive = new FlowGraphReceiveCustomEventBlock({ eventId: "event", eventData });
+        graph.addBlock(send);
+        graph.addBlock(receive);
+        graph.addEventBlock(receive);
+        const serialized: any = {};
+        graph.serialize(serialized);
+
+        const parsed = ParseFlowGraph(
+            serialized,
+            { coordinator },
+            serialized.allBlocks.map((block: any) => (block.className === send.getClassName() ? FlowGraphSendCustomEventBlock : FlowGraphReceiveCustomEventBlock))
+        );
+        const parsedSend = parsed.getAllBlocks().find((block) => block.getClassName() === send.getClassName()) as FlowGraphSendCustomEventBlock;
+        const parsedReceive = parsed.getAllBlocks().find((block) => block.getClassName() === receive.getClassName()) as FlowGraphReceiveCustomEventBlock;
+
+        expect(parsedSend.getDataInput("value")).toBeDefined();
+        expect(parsedReceive.getDataOutput("value")).toBeDefined();
+        expect(parsedSend.config.eventData.value.value).toBe(5);
+        expect(parsedReceive.config.eventData.value.value).toBe(5);
+    });
+
+    it("preserves importer-shaped custom-event schemas when provenance is enabled", () => {
+        const coordinator = new FlowGraphCoordinator({ scene });
+        const graph = coordinator.createGraph();
+        const send = new FlowGraphSendCustomEventBlock({ eventId: "event", eventData: {} });
+        const receive = new FlowGraphReceiveCustomEventBlock({ eventId: "event", eventData: {} });
+        graph.addBlock(send);
+        graph.addEventBlock(receive);
+        const serialized: any = {};
+        graph.serialize(serialized);
+        const eventData = [
+            {
+                eventData: true,
+                id: "score",
+                type: "number",
+                value: { type: "number", value: [5] },
+            },
+        ];
+        for (const serializedBlock of serialized.allBlocks) {
+            serializedBlock.config.eventData = eventData;
+        }
+        serialized.referenceProvenance = [];
+
+        const parsed = ParseFlowGraph(
+            serialized,
+            { coordinator },
+            serialized.allBlocks.map((block: any) => (block.className === send.getClassName() ? FlowGraphSendCustomEventBlock : FlowGraphReceiveCustomEventBlock))
+        );
+        const parsedSend = parsed.getAllBlocks().find((block) => block.getClassName() === send.getClassName()) as FlowGraphSendCustomEventBlock;
+        const parsedReceive = parsed.getAllBlocks().find((block) => block.getClassName() === receive.getClassName()) as FlowGraphReceiveCustomEventBlock;
+
+        expect(parsedSend.getDataInput("score")).toBeDefined();
+        expect(parsedReceive.getDataOutput("score")).toBeDefined();
+        expect(parsedSend.getDataInput("0")).toBeUndefined();
+        expect(parsedReceive.getDataOutput("0")).toBeUndefined();
+    });
+
+    it("preserves non-array custom parser results when provenance is enabled", () => {
+        const coordinator = new FlowGraphCoordinator({ scene });
+        const graph = coordinator.createGraph();
+        const block = new FlowGraphMeshIntersectionEventBlock();
+        graph.addEventBlock(block);
+        (block.targetMeshes as any)._defaultValue = [{ id: "part" }];
+        const serialized: any = {};
+        graph.serialize(serialized);
+        serialized.referenceProvenance = [];
+        const parsedTargets = new Float32Array([1, 2]);
+        const valueParseFunction = (key: string, serializationObject: any, assetsContainer: any, parseScene: Scene) => {
+            if (key === "defaultValue" && serializationObject.name === "targetMeshes") {
+                return parsedTargets;
+            }
+            return defaultValueParseFunction(key, serializationObject, assetsContainer, parseScene);
+        };
+
+        const parsed = ParseFlowGraph(serialized, { coordinator, valueParseFunction }, [FlowGraphMeshIntersectionEventBlock]);
+        const parsedBlock = parsed.getAllBlocks()[0] as FlowGraphMeshIntersectionEventBlock;
+
+        expect((parsedBlock.targetMeshes as any)._defaultValue).toBe(parsedTargets);
+    });
+
+    it("keeps mixed nested arrays serialized instead of resolving nested references", () => {
+        const coordinator = new FlowGraphCoordinator({ scene });
+        const graph = coordinator.createGraph();
+        const node = new Mesh("part", scene);
+        const serializedReference = { uniqueId: node.uniqueId, id: node.id, name: node.name, className: node.getClassName() };
+        const block = new FlowGraphConstantBlock({ value: [[serializedReference], "label"] });
+        graph.addBlock(block);
+        const serialized: any = {};
+        graph.serialize(serialized);
+        serialized.referenceProvenance = [
+            [
+                node.uniqueId,
+                {
+                    id: node.id,
+                    name: node.name,
+                    className: node.getClassName(),
+                    idIndex: 0,
+                    nameIndex: 0,
+                    sceneUid: scene.uid,
+                },
+            ],
+        ];
+
+        const parsed = ParseFlowGraph(serialized, { coordinator }, [FlowGraphConstantBlock]);
+        const parsedBlock = parsed.getAllBlocks()[0] as FlowGraphConstantBlock<any>;
+        const roundTripped: any = {};
+        parsed.serialize(roundTripped);
+
+        expect(parsedBlock.config.value).toEqual([[serializedReference], "label"]);
+        expect(parsedBlock.config.value[0][0]).not.toBe(node);
+        expect(roundTripped.allBlocks[0].config.value).toEqual([[serializedReference], "label"]);
+    });
+
+    it("Serializes and parses a block", () => {
+        // Serialize a block with path
+        // const mockContext: any = vi.mock("core/FlowGraph/flowGraphContext") as any;
+        // const pathConverter = new FlowGraphPathConverter(mockContext);
+
+        const block = new FlowGraphPlayAnimationBlock();
+        block.metadata = { source: { node: 3 } };
+
+        const serialized: any = {};
+        block.serialize(serialized);
+        expect(serialized.uniqueId).toBeDefined();
+        expect(serialized.signalInputs.length).toEqual(block.signalInputs.length);
+        expect(serialized.signalOutputs.length).toEqual(block.signalOutputs.length);
+        expect(serialized.dataInputs.length).toEqual(block.dataInputs.length);
+        expect(serialized.dataOutputs.length).toEqual(block.dataOutputs.length);
+        expect(serialized.className).toEqual("FlowGraphPlayAnimationBlock");
+        expect(serialized.metadata).toEqual(block.metadata);
+
+        const parsed = ParseFlowGraphBlockWithClassType(serialized, { scene }, FlowGraphPlayAnimationBlock);
+        expect(parsed.uniqueId).toEqual(block.uniqueId);
+        expect(parsed.getClassName()).toEqual("FlowGraphPlayAnimationBlock");
+        expect(parsed.dataInputs.length).toEqual(block.dataInputs.length);
+        expect(parsed.dataOutputs.length).toEqual(block.dataOutputs.length);
+        expect((parsed as FlowGraphExecutionBlock).signalInputs.length).toEqual(block.signalInputs.length);
+        expect((parsed as FlowGraphExecutionBlock).signalOutputs.length).toEqual(block.signalOutputs.length);
+        expect(parsed.metadata).toEqual(block.metadata);
+
+        // Serialize a block with configuration
+        const multiGateBlock = new FlowGraphMultiGateBlock({ outputSignalCount: 3, name: "MultiGate" });
+        const serialized2: any = {};
+        multiGateBlock.serialize(serialized2);
+        const parsed2 = ParseFlowGraphBlockWithClassType(serialized2, { scene }, FlowGraphMultiGateBlock) as any;
+        expect(parsed2.outputSignals.length).toEqual(3);
+    });
+
+    it.each([
+        [undefined, false, false],
+        [{ useVirtualStopAt: true, skipOnAnimationEnd: true }, true, true],
+    ])("preserves stop-animation mode through serialization", (config, expectedVirtualMode, expectedSkipEnd) => {
+        const block = new FlowGraphStopAnimationBlock(config);
+        const serialized: any = {};
+        block.serialize(serialized);
+
+        const parsed = ParseFlowGraphBlockWithClassType(serialized, { scene }, FlowGraphStopAnimationBlock) as FlowGraphStopAnimationBlock;
+
+        expect(serialized.config.useVirtualStopAt).toBe(expectedVirtualMode ? true : undefined);
+        expect(parsed.config?.useVirtualStopAt).toBe(expectedVirtualMode ? true : undefined);
+        expect(serialized.config.skipOnAnimationEnd).toBe(expectedSkipEnd ? true : undefined);
+        expect(parsed.config?.skipOnAnimationEnd).toBe(expectedSkipEnd ? true : undefined);
+    });
+
+    it("Serializes and parses a context", () => {
+        const coordinator = new FlowGraphCoordinator({ scene });
+        const graph = coordinator.createGraph();
+        const context = graph.createContext();
+
+        const mesh = new Mesh("testMesh", scene);
+
+        context.setVariable("test", 42);
+        context.setVariable("test2", "hello");
+        context.setVariable("test3", new Vector3(1, 2, 3));
+        context.setVariable("test4", mesh);
+
+        const flowGraphAddBlock = new FlowGraphAddBlock();
+
+        flowGraphAddBlock.a.setValue(1, context);
+        flowGraphAddBlock.b.setValue(2, context);
+
+        const serialized: any = {};
+        context.serialize(serialized);
+
+        expect(serialized._userVariables.test).toEqual(42);
+        expect(serialized._userVariables.test2).toEqual("hello");
+        expect(serialized._userVariables.test3.value).toEqual([1, 2, 3]);
+        expect(serialized._userVariables.test3.className).toEqual("Vector3");
+        expect(serialized._userVariables.test4.name).toEqual("testMesh");
+        expect(serialized._userVariables.test4.className).toEqual("Mesh");
+        expect(serialized._connectionValues[flowGraphAddBlock.a.uniqueId]).toEqual(1);
+        expect(serialized._connectionValues[flowGraphAddBlock.b.uniqueId]).toEqual(2);
+
+        const parsed = ParseFlowGraphContext(serialized, { graph });
+
+        expect(parsed.uniqueId).toEqual(context.uniqueId);
+        expect(parsed.getClassName()).toEqual("FlowGraphContext");
+        expect(parsed.getVariable("test")).toEqual(42);
+        expect(parsed.getVariable("test2")).toEqual("hello");
+        expect(parsed.getVariable("test3").x).toEqual(1);
+        expect(parsed.getVariable("test3").y).toEqual(2);
+        expect(parsed.getVariable("test3").z).toEqual(3);
+        expect(parsed._getConnectionValue(flowGraphAddBlock.a)).toEqual(1);
+        expect(parsed._getConnectionValue(flowGraphAddBlock.b)).toEqual(2);
+        expect(parsed.getVariable("test4").uniqueId).toEqual(mesh.uniqueId);
+    });
+
+    it.each([
+        ["ordinary object", { score: 42 }],
+        ["ordinary object with a value property", { value: 5 }],
+        ["typed value", new Vector3(1, 2, 3)],
+    ])("preserves an %s stored in a context variable named eventData", (_description, value) => {
+        const coordinator = new FlowGraphCoordinator({ scene });
+        const graph = coordinator.createGraph();
+        const context = graph.createContext();
+        context.setVariable("eventData", value);
+
+        const serialized: any = {};
+        context.serialize(serialized);
+        const parsed = ParseFlowGraphContext(serialized, { graph });
+
+        expect(parsed.getVariable("eventData")).toEqual(value);
+    });
+
+    it("Serializes and parses a graph", async () => {
+        const mockContext: any = {};
+        const pathConverter = new FlowGraphPathConverter(mockContext);
+
+        const coordinator = new FlowGraphCoordinator({ scene });
+        const graph = coordinator.createGraph();
+        graph.metadata = { source: { graph: 2 } };
+        const context = graph.createContext();
+
+        context.setVariable("test", 42);
+
+        const flowGraphSceneReadyBlock = new FlowGraphSceneReadyEventBlock();
+        graph.addEventBlock(flowGraphSceneReadyBlock);
+
+        const logBlock = new FlowGraphConsoleLogBlock();
+        flowGraphSceneReadyBlock.out.connectTo(logBlock.in);
+
+        const getVariableBlock = new FlowGraphGetVariableBlock({ variable: "test" });
+
+        logBlock.message.connectTo(getVariableBlock.value);
+
+        const serialized: any = {};
+        graph.serialize(serialized);
+        // Graph is serialized with all blocks
+        expect(serialized.allBlocks.length).toBe(3);
+
+        const parsed = await ParseFlowGraphAsync(serialized, { coordinator, pathConverter });
+        expect(parsed.metadata).toEqual(graph.metadata);
+        expect(parsed._eventBlocks[FlowGraphEventType.SceneReady].length).toBe(1);
+        parsed.start();
+
+        expect(Logger.Log).toHaveBeenCalledWith(42);
+    });
+
+    it("parses connections from either side of serialized connection ids", async () => {
+        const mockContext: any = {};
+        const pathConverter = new FlowGraphPathConverter(mockContext);
+
+        const coordinator = new FlowGraphCoordinator({ scene });
+        const graph = coordinator.createGraph();
+        const context = graph.createContext();
+        context.setVariable("test", 42);
+
+        const sceneReadyBlock = new FlowGraphSceneReadyEventBlock();
+        graph.addEventBlock(sceneReadyBlock);
+
+        const logBlock = new FlowGraphConsoleLogBlock();
+        sceneReadyBlock.out.connectTo(logBlock.in);
+
+        const getVariableBlock = new FlowGraphGetVariableBlock({ variable: "test" });
+        logBlock.message.connectTo(getVariableBlock.value);
+
+        const serialized: any = {};
+        graph.serialize(serialized);
+
+        const sceneReadyJson = serialized.allBlocks.find((block: any) => block.className === "FlowGraphSceneReadyEventBlock");
+        sceneReadyJson.signalOutputs.find((signalOutput: any) => signalOutput.name === "out").connectedPointIds = [];
+
+        const logJson = serialized.allBlocks.find((block: any) => block.className === "FlowGraphConsoleLogBlock");
+        logJson.dataInputs.find((dataInput: any) => dataInput.name === "message").connectedPointIds = [];
+
+        const parsed = await ParseFlowGraphAsync(serialized, { coordinator, pathConverter });
+        parsed.start();
+
+        expect(Logger.Log).toHaveBeenCalledWith(42);
+    });
+
+    it("parses a flow graph coordinator from a snippet", async () => {
+        const coordinator = new FlowGraphCoordinator({ scene });
+        const graph = coordinator.createGraph("Snippet Graph");
+        graph.addEventBlock(new FlowGraphSceneReadyEventBlock());
+
+        const serializedGraph: any = {};
+        graph.serialize(serializedGraph);
+        const serializedCoordinator = { _flowGraphs: [serializedGraph], activeGraphIndex: 0 };
+        const fetchMock = MockFlowGraphSnippet(serializedCoordinator);
+
+        const parsedCoordinator = await ParseFlowGraphCoordinatorFromSnippetAsync("ABC123#4", { scene });
+
+        expect(fetchMock.mock.calls[0][0]).toBe(Constants.SnippetUrl + "/ABC123/4");
+        expect(parsedCoordinator.flowGraphs.length).toBe(1);
+        expect(parsedCoordinator.flowGraphs[0].name).toBe("Snippet Graph");
+    });
+
+    it("preserves false dispatch settings when parsing a coordinator", async () => {
+        const coordinator = new FlowGraphCoordinator({ scene });
+        coordinator.dispatchEventsSynchronously = false;
+        coordinator.createGraph("Async Events Graph");
+
+        const serializedCoordinator: any = {};
+        coordinator.serialize(serializedCoordinator);
+
+        const parsedCoordinator = await ParseCoordinatorAsync(serializedCoordinator, { scene });
+
+        expect(parsedCoordinator.dispatchEventsSynchronously).toBe(false);
+    });
+
+    it("uses reference provenance when parsing duplicate scene nodes", async () => {
+        const sourceScene = new Scene(engine);
+        const sourceFirst = new Mesh("part", sourceScene);
+        const sourceSecond = new Mesh("part", sourceScene);
+        sourceSecond.id = sourceFirst.id;
+        const source = new Mesh("source", sourceScene);
+        const sourceCoordinator = new FlowGraphCoordinator({ scene: sourceScene });
+        const sourceGraph = sourceCoordinator.createGraph();
+        const block = new FlowGraphMeshIntersectionEventBlock();
+        sourceGraph.addEventBlock(block);
+        (block.sourceMesh as any)._defaultValue = source;
+        (block.targetMeshes as any)._defaultValue = [sourceSecond];
+        const serialized: any = {};
+        sourceCoordinator.serialize(serialized);
+        serialized.referenceProvenance = [
+            [
+                sourceSecond.uniqueId,
+                {
+                    id: sourceSecond.id,
+                    name: sourceSecond.name,
+                    className: sourceSecond.getClassName(),
+                    idIndex: 1,
+                    nameIndex: 1,
+                    sceneUid: sourceScene.uid,
+                },
+            ],
+        ];
+        const targetFirst = new Mesh("part", scene);
+        const targetSecond = new Mesh("part", scene);
+        targetSecond.id = targetFirst.id;
+        const targetSource = new Mesh("source", scene);
+
+        const parsedCoordinator = await ParseCoordinatorAsync(serialized, { scene });
+        const parsedBlock = parsedCoordinator.flowGraphs[0].getAllBlocks()[0] as FlowGraphMeshIntersectionEventBlock;
+        const context = parsedCoordinator.flowGraphs[0].createContext();
+        const intersects = vi.spyOn(targetSource, "intersectsMesh").mockReturnValue(true);
+        const activate = vi.spyOn(parsedBlock.onEnter as any, "_activateSignal");
+
+        expect((parsedBlock.targetMeshes as any)._defaultValue).toEqual([targetSecond]);
+        expect((parsedBlock.targetMeshes as any)._defaultValue).not.toEqual([targetFirst]);
+        parsedBlock._executeEvent(context, null);
+        expect(intersects).toHaveBeenCalledWith(targetSecond, false);
+        expect(activate).toHaveBeenCalledWith(context);
+
+        targetSecond.name = "renamed";
+        const resolvedSerialization: any = {};
+        parsedCoordinator.serialize(resolvedSerialization);
+        expect(resolvedSerialization._flowGraphs[0].referenceProvenance).toContainEqual([
+            targetSecond.uniqueId,
+            expect.objectContaining({ name: "renamed", idIndex: 1, nameIndex: 0, sceneUid: scene.uid }),
+        ]);
+        const nextScene = new Scene(engine);
+        const nextFirst = new Mesh("part", nextScene);
+        const nextSecond = new Mesh("renamed", nextScene);
+        nextSecond.id = nextFirst.id;
+        new Mesh("source", nextScene);
+        const reparsedResolvedCoordinator = await ParseCoordinatorAsync(resolvedSerialization, { scene: nextScene });
+        const reparsedResolvedBlock = reparsedResolvedCoordinator.flowGraphs[0].getAllBlocks()[0] as FlowGraphMeshIntersectionEventBlock;
+        expect((reparsedResolvedBlock.targetMeshes as any)._defaultValue).toEqual([nextSecond]);
+
+        reparsedResolvedCoordinator.dispose();
+        nextScene.dispose();
+        parsedCoordinator.dispose();
+        targetSecond.dispose();
+        const missingTargetCoordinator = await ParseCoordinatorAsync(serialized, { scene });
+        const missingTargetBlock = missingTargetCoordinator.flowGraphs[0].getAllBlocks()[0] as FlowGraphMeshIntersectionEventBlock;
+        expect((missingTargetBlock.targetMeshes as any)._defaultValue).not.toEqual([targetFirst]);
+        expect((missingTargetBlock.targetMeshes as any)._defaultValue).toEqual([expect.objectContaining({ uniqueId: sourceSecond.uniqueId })]);
+
+        const reserialized: any = {};
+        missingTargetCoordinator.serialize(reserialized);
+        expect(reserialized._flowGraphs[0].referenceProvenance).toEqual(serialized.referenceProvenance);
+        const reparsedCoordinator = await ParseCoordinatorAsync(reserialized, { scene });
+        const reparsedBlock = reparsedCoordinator.flowGraphs[0].getAllBlocks()[0] as FlowGraphMeshIntersectionEventBlock;
+        expect((reparsedBlock.targetMeshes as any)._defaultValue).not.toEqual([targetFirst]);
+        expect((reparsedBlock.targetMeshes as any)._defaultValue).toEqual([expect.objectContaining({ uniqueId: sourceSecond.uniqueId })]);
+
+        reparsedCoordinator.dispose();
+        missingTargetCoordinator.dispose();
+        sourceCoordinator.dispose();
+        sourceScene.dispose();
+    });
+
+    it("refreshes overlapping resolved provenance identities before reserialization", async () => {
+        const sourceScene = new Scene(engine);
+        const sourceB = new Mesh("B", sourceScene);
+        const sourceC = new Mesh("C", sourceScene);
+        (sourceB as any).uniqueId = 10;
+        (sourceC as any).uniqueId = 11;
+        const sourceCoordinator = new FlowGraphCoordinator({ scene: sourceScene });
+        const sourceGraph = sourceCoordinator.createGraph();
+        const blockB = new FlowGraphMeshIntersectionEventBlock();
+        const blockC = new FlowGraphMeshIntersectionEventBlock();
+        sourceGraph.addEventBlock(blockB);
+        sourceGraph.addEventBlock(blockC);
+        (blockB.targetMeshes as any)._defaultValue = [sourceB];
+        (blockC.targetMeshes as any)._defaultValue = [sourceC];
+        const serialized: any = {};
+        sourceCoordinator.serialize(serialized);
+        serialized.referenceProvenance = [
+            [10, { id: sourceB.id, name: sourceB.name, className: sourceB.getClassName(), idIndex: 0, nameIndex: 0, sceneUid: sourceScene.uid }],
+            [11, { id: sourceC.id, name: sourceC.name, className: sourceC.getClassName(), idIndex: 0, nameIndex: 0, sceneUid: sourceScene.uid }],
+        ];
+
+        const destinationScene = new Scene(engine);
+        const destinationB = new Mesh("B", destinationScene);
+        const destinationC = new Mesh("C", destinationScene);
+        (destinationB as any).uniqueId = 11;
+        (destinationC as any).uniqueId = 12;
+        const parsed = await ParseCoordinatorAsync(serialized, { scene: destinationScene });
+        const reserialized: any = {};
+        parsed.serialize(reserialized);
+        expect(reserialized._flowGraphs[0].referenceProvenance).toEqual(
+            expect.arrayContaining([
+                [11, expect.objectContaining({ name: "B" })],
+                [12, expect.objectContaining({ name: "C" })],
+            ])
+        );
+
+        const finalScene = new Scene(engine);
+        const finalB = new Mesh("B", finalScene);
+        const finalC = new Mesh("C", finalScene);
+        const reparsed = await ParseCoordinatorAsync(reserialized, { scene: finalScene });
+        const reparsedBlocks = reparsed.flowGraphs[0].getAllBlocks() as FlowGraphMeshIntersectionEventBlock[];
+        expect((reparsedBlocks[0].targetMeshes as any)._defaultValue).toEqual([finalB]);
+        expect((reparsedBlocks[1].targetMeshes as any)._defaultValue).toEqual([finalC]);
+
+        reparsed.dispose();
+        finalScene.dispose();
+        parsed.dispose();
+        destinationScene.dispose();
+        sourceCoordinator.dispose();
+        sourceScene.dispose();
+    });
+
+    it("keeps provenance local to separately parsed graphs", async () => {
+        const firstNode = new Mesh("first", scene);
+        const secondNode = new Mesh("second", scene);
+        (firstNode as any).uniqueId = 10;
+        (secondNode as any).uniqueId = 10;
+        const firstCoordinator = new FlowGraphCoordinator({ scene });
+        const firstGraph = firstCoordinator.createGraph();
+        const firstBlock = new FlowGraphMeshIntersectionEventBlock();
+        firstGraph.addEventBlock(firstBlock);
+        (firstBlock.targetMeshes as any)._defaultValue = [firstNode];
+        const firstSerialized: any = {};
+        firstGraph.serialize(firstSerialized);
+        firstSerialized.referenceProvenance = [
+            [firstNode.uniqueId, { id: firstNode.id, name: firstNode.name, className: firstNode.getClassName(), idIndex: 0, nameIndex: 0, sceneUid: scene.uid }],
+        ];
+
+        const secondCoordinator = new FlowGraphCoordinator({ scene });
+        const secondGraph = secondCoordinator.createGraph();
+        const secondBlock = new FlowGraphMeshIntersectionEventBlock();
+        secondGraph.addEventBlock(secondBlock);
+        (secondBlock.targetMeshes as any)._defaultValue = [secondNode];
+        const secondSerialized: any = {};
+        secondGraph.serialize(secondSerialized);
+        secondSerialized.referenceProvenance = [
+            [secondNode.uniqueId, { id: secondNode.id, name: secondNode.name, className: secondNode.getClassName(), idIndex: 0, nameIndex: 0, sceneUid: scene.uid }],
+        ];
+
+        const targetCoordinator = new FlowGraphCoordinator({ scene });
+        await ParseFlowGraphAsync(firstSerialized, { coordinator: targetCoordinator });
+        await ParseFlowGraphAsync(secondSerialized, { coordinator: targetCoordinator });
+        const merged: any = {};
+        targetCoordinator.serialize(merged);
+
+        expect(merged.referenceProvenance).toBeUndefined();
+        expect(merged._flowGraphs[0].referenceProvenance).toContainEqual([firstNode.uniqueId, expect.objectContaining({ name: firstNode.name })]);
+        expect(merged._flowGraphs[1].referenceProvenance).toContainEqual([secondNode.uniqueId, expect.objectContaining({ name: secondNode.name })]);
+
+        const reloadScene = new Scene(engine);
+        const reloadedFirst = new Mesh("first", reloadScene);
+        const reloadedSecond = new Mesh("second", reloadScene);
+        const reloaded = await ParseCoordinatorAsync(merged, { scene: reloadScene });
+        const reloadedFirstBlock = reloaded.flowGraphs[0].getAllBlocks()[0] as FlowGraphMeshIntersectionEventBlock;
+        const reloadedSecondBlock = reloaded.flowGraphs[1].getAllBlocks()[0] as FlowGraphMeshIntersectionEventBlock;
+        expect((reloadedFirstBlock.targetMeshes as any)._defaultValue).toEqual([reloadedFirst]);
+        expect((reloadedSecondBlock.targetMeshes as any)._defaultValue).toEqual([reloadedSecond]);
+
+        reloaded.dispose();
+        reloadScene.dispose();
+        targetCoordinator.dispose();
+        firstCoordinator.dispose();
+        secondCoordinator.dispose();
+    });
+
+    it("returns the active flow graph from a snippet", async () => {
+        const coordinator = new FlowGraphCoordinator({ scene });
+        const firstGraph = coordinator.createGraph("First Graph");
+        const activeGraph = coordinator.createGraph("Active Graph");
+
+        const firstSerializedGraph: any = {};
+        firstGraph.serialize(firstSerializedGraph);
+        const activeSerializedGraph: any = {};
+        activeGraph.serialize(activeSerializedGraph);
+        MockFlowGraphSnippet({ _flowGraphs: [firstSerializedGraph, activeSerializedGraph], activeGraphIndex: 1 });
+
+        const targetCoordinator = new FlowGraphCoordinator({ scene });
+        const parsedActiveGraph = await ParseFlowGraphFromSnippetAsync("ABC123#4", { coordinator: targetCoordinator });
+
+        expect(targetCoordinator.flowGraphs.length).toBe(2);
+        expect(parsedActiveGraph.name).toBe("Active Graph");
+    });
+
+    it("Preserves name and uniqueId across serialize/parse roundtrip", async () => {
+        const coordinator = new FlowGraphCoordinator({ scene });
+        const graph = coordinator.createGraph("My Custom Graph");
+        const originalUniqueId = graph.uniqueId;
+
+        // Verify defaults
+        expect(graph.name).toBe("My Custom Graph");
+        expect(graph.uniqueId).toBeDefined();
+
+        const serialized: any = {};
+        graph.serialize(serialized);
+        expect(serialized.name).toBe("My Custom Graph");
+        expect(serialized.uniqueId).toBe(originalUniqueId);
+
+        // Parse back
+        const coordinator2 = new FlowGraphCoordinator({ scene });
+        const parsed = ParseFlowGraph(serialized, { coordinator: coordinator2 }, []);
+        expect(parsed.name).toBe("My Custom Graph");
+        expect(parsed.uniqueId).toBe(originalUniqueId);
+    });
+
+    it("Uses default name and generates uniqueId when absent in serialized data", () => {
+        const coordinator = new FlowGraphCoordinator({ scene });
+        // Simulate legacy data with no name/uniqueId fields
+        const legacyData: any = { allBlocks: [], executionContexts: [] };
+        const parsed = ParseFlowGraph(legacyData, { coordinator }, []);
+        // Should have a default name and a generated uniqueId
+        expect(parsed.name).toBeDefined();
+        expect(parsed.uniqueId).toBeDefined();
+        expect(parsed.uniqueId.length).toBeGreaterThan(0);
+    });
+
+    it("Serializes and parses a graph with vector and mesh references", () => {
+        const coordinator = new FlowGraphCoordinator({ scene });
+        const graph = coordinator.createGraph();
+        const context = graph.createContext();
+
+        const mesh = new Mesh("testMesh", scene);
+        context.setVariable("testMesh", mesh);
+
+        const flowGraphSceneReadyBlock = new FlowGraphSceneReadyEventBlock();
+        graph.addEventBlock(flowGraphSceneReadyBlock);
+
+        const pathConverter = new FlowGraphPathConverter(context);
+        const setPropertyBlock = new FlowGraphSetPropertyBlock<Vector3, FlowGraphAssetType.Mesh>({ propertyName: "position", target: mesh });
+        flowGraphSceneReadyBlock.out.connectTo(setPropertyBlock.in);
+
+        const constBlock = new FlowGraphConstantBlock<Vector3>({ value: new Vector3(1, 2, 3) });
+        constBlock.output.connectTo(setPropertyBlock.value);
+
+        const serialized: any = {};
+        graph.serialize(serialized);
+
+        const parsed = ParseFlowGraph(serialized, { coordinator, pathConverter }, [FlowGraphSceneReadyEventBlock, FlowGraphSetPropertyBlock, FlowGraphConstantBlock]);
+        parsed.start();
+
+        scene.onReadyObservable.notifyObservers(scene);
+        expect(mesh.position.asArray()).toEqual([1, 2, 3]);
+    });
+
+    it("parses scene node references by id when unique ids differ", async () => {
+        const coordinator = new FlowGraphCoordinator({ scene });
+        const graph = coordinator.createGraph();
+        const camera = new ArcRotateCamera("camera1", 0, 0, 10, Vector3.Zero(), scene);
+
+        const flowGraphSceneReadyBlock = new FlowGraphSceneReadyEventBlock();
+        graph.addEventBlock(flowGraphSceneReadyBlock);
+
+        const setPropertyBlock = new FlowGraphSetPropertyBlock<number, FlowGraphAssetType.Camera>({ propertyName: "alpha" });
+        flowGraphSceneReadyBlock.out.connectTo(setPropertyBlock.in);
+
+        const cameraBlock = new FlowGraphConstantBlock<ArcRotateCamera>({ value: camera });
+        cameraBlock.output.connectTo(setPropertyBlock.object);
+
+        const valueBlock = new FlowGraphConstantBlock<number>({ value: 1 });
+        valueBlock.output.connectTo(setPropertyBlock.value);
+
+        const serialized: any = {};
+        graph.serialize(serialized);
+        const cameraBlockJson = serialized.allBlocks.find((block: any) => block.uniqueId === cameraBlock.uniqueId);
+        cameraBlockJson.config.value.uniqueId = -1;
+
+        const parsed = await ParseFlowGraphAsync(serialized, { coordinator });
+        parsed.start();
+
+        scene.onReadyObservable.notifyObservers(scene);
+        expect(camera.alpha).toBe(1);
+    });
+
+    it("setScene re-resolves node references against the new scene", () => {
+        // Mimics an editor that loads a graph before its referenced scene exists: the parser leaves
+        // node-targeting inputs holding the raw serialized reference ({ id, name, className, uniqueId })
+        // instead of a live node. Moving the graph to the populated scene via setScene must rebind those
+        // references to the matching nodes in the new scene (uniqueIds differ across scene builds).
+        const coordinator = new FlowGraphCoordinator({ scene });
+        const graph = coordinator.createGraph();
+
+        // Case 1: an unresolved serialized reference left by the parser (node absent at parse time).
+        const unresolvedBlock = new FlowGraphSetPropertyBlock<Vector3, FlowGraphAssetType.Mesh>({ propertyName: "position" });
+        graph.addBlock(unresolvedBlock);
+        (unresolvedBlock.object as any)._defaultValue = { id: "hero", name: "hero", className: "Mesh", uniqueId: 20 };
+
+        // Case 2: a reference to a node that belongs to a different (e.g. disposed) scene.
+        const oldScene = new Scene(engine);
+        const oldGoomba = new Mesh("goomba", oldScene);
+        const staleBlock = new FlowGraphSetPropertyBlock<Vector3, FlowGraphAssetType.Mesh>({ propertyName: "position", target: oldGoomba });
+        graph.addBlock(staleBlock);
+
+        // Case 3: a non-node value must be left untouched.
+        const numberBlock = new FlowGraphSetPropertyBlock<number, FlowGraphAssetType.Mesh>({ propertyName: "visibility" });
+        graph.addBlock(numberBlock);
+        (numberBlock.object as any)._defaultValue = 42;
+
+        // The populated preview scene holds fresh instances with different uniqueIds.
+        const previewScene = new Scene(engine);
+        const liveHero = new Mesh("hero", previewScene);
+        const liveGoomba = new Mesh("goomba", previewScene);
+
+        graph.setScene(previewScene);
+
+        const context = graph.createContext();
+        expect(unresolvedBlock.object.getValue(context)).toBe(liveHero);
+        expect(staleBlock.object.getValue(context)).toBe(liveGoomba);
+        expect(numberBlock.object.getValue(context)).toBe(42);
+
+        oldScene.dispose();
+        previewScene.dispose();
+    });
+
+    it("setScene re-resolves arrays of node references against the new scene", () => {
+        const coordinator = new FlowGraphCoordinator({ scene });
+        const graph = coordinator.createGraph();
+        const block = new FlowGraphSetPropertyBlock<Vector3, FlowGraphAssetType.Mesh>({ propertyName: "position" });
+        graph.addBlock(block);
+
+        const oldScene = new Scene(engine);
+        const oldGoomba = new Mesh("goomba", oldScene);
+        (block.object as any)._defaultValue = [{ id: "hero", name: "hero", className: "Mesh", uniqueId: 20 }, oldGoomba, { id: "missing", className: "Mesh" }];
+
+        const previewScene = new Scene(engine);
+        const liveHero = new Mesh("hero", previewScene);
+        const liveGoomba = new Mesh("goomba", previewScene);
+
+        graph.setScene(previewScene);
+
+        const value = block.object.getValue(graph.createContext()) as unknown as any[];
+        expect(value[0]).toBe(liveHero);
+        expect(value[1]).toBe(liveGoomba);
+        expect(value[2]).toEqual({ id: "missing", className: "Mesh" });
+
+        oldScene.dispose();
+        previewScene.dispose();
+    });
+
+    it("serializes arrays mixing live nodes and unresolved node references", () => {
+        const mesh = new Mesh("live", scene);
+        const unresolved = { id: "later", name: "later", className: "Mesh", uniqueId: 7 };
+        const serialized: any = {};
+        defaultValueSerializationFunction("targets", [mesh, unresolved], serialized);
+        expect(serialized.targets).toEqual([{ id: mesh.id, name: "live", className: "Mesh", uniqueId: mesh.uniqueId }, unresolved]);
+        expect(serialized.targets[1]).not.toBe(unresolved);
+
+        const parsed = defaultValueParseFunction("targets", serialized, scene, scene);
+        expect(parsed[0]).toBe(mesh);
+        expect(parsed[1]).toEqual(unresolved);
+    });
+
+    it("Event block fires both out and done signals after round-trip", async () => {
+        const mockContext: any = {};
+        const pathConverter = new FlowGraphPathConverter(mockContext);
+
+        // Test 1: downstream connected via 'out'
+        const coordinator1 = new FlowGraphCoordinator({ scene });
+        const graph1 = coordinator1.createGraph();
+        const ctx1 = graph1.createContext();
+        ctx1.setVariable("test", "via-out");
+
+        const sceneReady1 = new FlowGraphSceneReadyEventBlock();
+        graph1.addEventBlock(sceneReady1);
+        const log1 = new FlowGraphConsoleLogBlock();
+        sceneReady1.out.connectTo(log1.in);
+        const getVar1 = new FlowGraphGetVariableBlock({ variable: "test" });
+        log1.message.connectTo(getVar1.value);
+
+        const serialized1: any = {};
+        graph1.serialize(serialized1);
+        const parsed1 = await ParseFlowGraphAsync(serialized1, { coordinator: coordinator1, pathConverter });
+        parsed1.start();
+        expect(Logger.Log).toHaveBeenCalledWith("via-out");
+
+        // Test 2: downstream connected via 'done'
+        const coordinator2 = new FlowGraphCoordinator({ scene });
+        const graph2 = coordinator2.createGraph();
+        const ctx2 = graph2.createContext();
+        ctx2.setVariable("test", "via-done");
+
+        const sceneReady2 = new FlowGraphSceneReadyEventBlock();
+        graph2.addEventBlock(sceneReady2);
+        const log2 = new FlowGraphConsoleLogBlock();
+        sceneReady2.done.connectTo(log2.in);
+        const getVar2 = new FlowGraphGetVariableBlock({ variable: "test" });
+        log2.message.connectTo(getVar2.value);
+
+        const serialized2: any = {};
+        graph2.serialize(serialized2);
+        const parsed2 = await ParseFlowGraphAsync(serialized2, { coordinator: coordinator2, pathConverter });
+        parsed2.start();
+        expect(Logger.Log).toHaveBeenCalledWith("via-done");
+    });
+
+    it("Binary operation blocks have correct getClassName after construction", () => {
+        const addBlock = new FlowGraphAddBlock();
+        expect(addBlock.getClassName()).toEqual("FlowGraphAddBlock");
+
+        const divideBlock = new FlowGraphDivideBlock();
+        expect(divideBlock.getClassName()).toEqual("FlowGraphDivideBlock");
+
+        const multiplyBlock = new FlowGraphMultiplyBlock();
+        expect(multiplyBlock.getClassName()).toEqual("FlowGraphMultiplyBlock");
+
+        const subtractBlock = new FlowGraphSubtractBlock();
+        expect(subtractBlock.getClassName()).toEqual("FlowGraphSubtractBlock");
+    });
+
+    it("Unconnected input values survive serialize → parse round-trip", () => {
+        const coordinator = new FlowGraphCoordinator({ scene });
+        const graph = coordinator.createGraph();
+        const context = graph.createContext();
+
+        const divideBlock = new FlowGraphDivideBlock();
+        // Set unconnected input "b" to 2 (simulating KHR_interactivity default)
+        divideBlock.b.setValue(2, context);
+        // Set "a" to 10
+        divideBlock.a.setValue(10, context);
+
+        const serialized: any = {};
+        context.serialize(serialized);
+
+        // Connection values should be in the serialized context
+        expect(serialized._connectionValues[divideBlock.a.uniqueId]).toEqual(10);
+        expect(serialized._connectionValues[divideBlock.b.uniqueId]).toEqual(2);
+
+        // Parse back
+        const parsed = ParseFlowGraphContext(serialized, { graph });
+        expect(parsed._getConnectionValue(divideBlock.a)).toEqual(10);
+        expect(parsed._getConnectionValue(divideBlock.b)).toEqual(2);
+    });
+
+    it("Math graph with unconnected inputs produces correct results after round-trip", async () => {
+        const mockContext: any = {};
+        const pathConverter = new FlowGraphPathConverter(mockContext);
+
+        const coordinator = new FlowGraphCoordinator({ scene });
+        const graph = coordinator.createGraph();
+        const context = graph.createContext();
+
+        // Build: OnSceneReady → Log(10 / 2) = 5
+        const sceneReady = new FlowGraphSceneReadyEventBlock();
+        graph.addEventBlock(sceneReady);
+
+        const divideBlock = new FlowGraphDivideBlock();
+        // a=10 (unconnected), b=2 (unconnected)
+        divideBlock.a.setValue(10, context);
+        divideBlock.b.setValue(2, context);
+
+        const logBlock = new FlowGraphConsoleLogBlock();
+        sceneReady.out.connectTo(logBlock.in);
+        logBlock.message.connectTo(divideBlock.value);
+
+        // Serialize entire graph
+        const serialized: any = {};
+        graph.serialize(serialized);
+
+        // Deserialize into a new coordinator
+        const coordinator2 = new FlowGraphCoordinator({ scene });
+        const parsed = await ParseFlowGraphAsync(serialized, { coordinator: coordinator2, pathConverter });
+
+        parsed.start();
+        expect(Logger.Log).toHaveBeenCalledWith(5);
+    });
+
+    it("TransformNode references survive serialize → parse round-trip", () => {
+        const coordinator = new FlowGraphCoordinator({ scene });
+        const graph = coordinator.createGraph();
+        const context = graph.createContext();
+
+        const transformNode = new TransformNode("myTransform", scene);
+        context.setVariable("testNode", transformNode);
+
+        const serialized: any = {};
+        context.serialize(serialized);
+
+        // Serialized as an object with name and className
+        expect(serialized._userVariables.testNode.name).toEqual("myTransform");
+        expect(serialized._userVariables.testNode.className).toEqual("TransformNode");
+
+        // Parse back — should resolve to the same TransformNode in the scene
+        const parsed = ParseFlowGraphContext(serialized, { graph });
+        const resolved = parsed.getVariable("testNode");
+        expect(resolved).toBeDefined();
+        expect(resolved.uniqueId).toEqual(transformNode.uniqueId);
+        expect(resolved.name).toEqual("myTransform");
+    });
+
+    it("Multiple meshes with the same id are distinguished by uniqueId through round-trip", () => {
+        const coordinator = new FlowGraphCoordinator({ scene });
+        const graph = coordinator.createGraph();
+        const context = graph.createContext();
+
+        // Create 3 meshes that share the same name/id (simulates glTF instancing)
+        const meshA = new Mesh("Button", scene);
+        const meshB = new Mesh("Button", scene);
+        const meshC = new Mesh("Button", scene);
+
+        // All three have the same id
+        expect(meshA.id).toEqual(meshB.id);
+        expect(meshB.id).toEqual(meshC.id);
+        // But different uniqueIds
+        expect(meshA.uniqueId).not.toEqual(meshB.uniqueId);
+        expect(meshB.uniqueId).not.toEqual(meshC.uniqueId);
+
+        context.setVariable("pickedMesh_0", meshA);
+        context.setVariable("pickedMesh_1", meshB);
+        context.setVariable("pickedMesh_2", meshC);
+
+        const serialized: any = {};
+        context.serialize(serialized);
+
+        // All three serialized with uniqueId preserved
+        expect(serialized._userVariables.pickedMesh_0.uniqueId).toEqual(meshA.uniqueId);
+        expect(serialized._userVariables.pickedMesh_1.uniqueId).toEqual(meshB.uniqueId);
+        expect(serialized._userVariables.pickedMesh_2.uniqueId).toEqual(meshC.uniqueId);
+
+        // Parse back — each variable should resolve to its SPECIFIC mesh
+        const parsed = ParseFlowGraphContext(serialized, { graph });
+        const resolvedA = parsed.getVariable("pickedMesh_0");
+        const resolvedB = parsed.getVariable("pickedMesh_1");
+        const resolvedC = parsed.getVariable("pickedMesh_2");
+
+        expect(resolvedA).toBe(meshA);
+        expect(resolvedB).toBe(meshB);
+        expect(resolvedC).toBe(meshC);
+    });
+
+    it("Serialization includes uniqueId for mesh references", () => {
+        const mesh = new Mesh("myMesh", scene);
+        const serialized: any = {};
+        defaultValueSerializationFunction("target", mesh, serialized);
+
+        expect(serialized.target).toBeDefined();
+        expect(serialized.target.id).toEqual("myMesh");
+        expect(serialized.target.name).toEqual("myMesh");
+        expect(serialized.target.className).toEqual("Mesh");
+        expect(serialized.target.uniqueId).toEqual(mesh.uniqueId);
+    });
+
+    it("TransformNode class name is recognized as a mesh type for serialization round-trip", () => {
+        const coordinator = new FlowGraphCoordinator({ scene });
+        const graph = coordinator.createGraph();
+        const context = graph.createContext();
+
+        const tn = new TransformNode("myTN", scene);
+        context.setVariable("tnVar", tn);
+
+        const serialized: any = {};
+        context.serialize(serialized);
+
+        expect(serialized._userVariables.tnVar.className).toEqual("TransformNode");
+
+        const parsed = ParseFlowGraphContext(serialized, { graph });
+        const resolved = parsed.getVariable("tnVar");
+        expect(resolved).toBe(tn);
+    });
+
+    it("InstancedMesh class name is recognized as a mesh type for serialization round-trip", () => {
+        const coordinator = new FlowGraphCoordinator({ scene });
+        const graph = coordinator.createGraph();
+        const context = graph.createContext();
+
+        const sourceMesh = new Mesh("source", scene);
+        const instance = sourceMesh.createInstance("inst1");
+        context.setVariable("instVar", instance);
+
+        const serialized: any = {};
+        context.serialize(serialized);
+
+        // InstancedMesh should serialize with className and uniqueId
+        expect(serialized._userVariables.instVar.className).toBeDefined();
+        expect(serialized._userVariables.instVar.uniqueId).toEqual(instance.uniqueId);
+    });
+
+    it("Serialization skips pathConverter key gracefully", () => {
+        const serialized: any = {};
+        const fakePathConverter = { convert: () => ({}) };
+        defaultValueSerializationFunction("pathConverter", fakePathConverter, serialized);
+        expect(serialized.pathConverter).toBeUndefined();
+    });
+
+    it("Serialization skips objects with function properties", () => {
+        const serialized: any = {};
+        const objWithFn = { name: "test", doSomething: () => {} };
+        defaultValueSerializationFunction("myKey", objWithFn, serialized);
+        expect(serialized.myKey).toBeUndefined();
+    });
+
+    it("Serialization stores plain JSON-safe objects", () => {
+        const serialized: any = {};
+        const plainObj = { a: 1, b: "hello", c: true };
+        defaultValueSerializationFunction("config", plainObj, serialized);
+        expect(serialized.config).toEqual({ a: 1, b: "hello", c: true });
+    });
+
+    it("Plain array of primitives survives parse round-trip without being treated as event config", () => {
+        const coordinator = new FlowGraphCoordinator({ scene });
+        const graph = coordinator.createGraph();
+        const context = graph.createContext();
+
+        // Store a plain array of strings (like variable name lists from variable/set)
+        context.setVariable("varNames", ["rotation", "position", "scale"]);
+
+        const serialized: any = {};
+        context.serialize(serialized);
+
+        // Should be stored as-is (not reduced to an object)
+        expect(Array.isArray(serialized._userVariables.varNames)).toBe(true);
+        expect(serialized._userVariables.varNames).toEqual(["rotation", "position", "scale"]);
+
+        const parsed = ParseFlowGraphContext(serialized, { graph });
+        const resolved = parsed.getVariable("varNames");
+        expect(Array.isArray(resolved)).toBe(true);
+        expect(resolved).toEqual(["rotation", "position", "scale"]);
+    });
+
+    it("Round-trips defaultValue on unconnected data inputs", async () => {
+        const coordinator = new FlowGraphCoordinator({ scene });
+        const graph = coordinator.createGraph();
+
+        // Create an Add block and set an inline value on input "b"
+        const addBlock = new FlowGraphAddBlock({ typeName: "number" });
+        graph.addBlock(addBlock);
+        const bInput = addBlock.getDataInput("b")!;
+        (bInput as any)._defaultValue = 42;
+
+        // Create a context with user variables and variable types
+        const ctx = graph.createContext();
+        ctx.setVariable("myVar", 123);
+        ctx.setVariableType("myVar", "number");
+        ctx.name = "TestContext";
+
+        // Serialize
+        const serialized: any = {};
+        graph.serialize(serialized);
+
+        // Verify serialized data has the inline value and context data
+        expect(serialized.executionContexts.length).toBe(1);
+        expect(serialized.executionContexts[0].name).toBe("TestContext");
+        expect(serialized.executionContexts[0]._variableTypes).toEqual({ myVar: "number" });
+
+        const serializedBInput = serialized.allBlocks[0].dataInputs.find((i: any) => i.name === "b");
+        expect(serializedBInput.defaultValue).toBe(42);
+
+        // Parse it back
+        const coordinator2 = new FlowGraphCoordinator({ scene });
+        const parsedGraph = await ParseFlowGraphAsync(serialized, { coordinator: coordinator2 });
+
+        // Verify inline value survived
+        const parsedAdd = parsedGraph.getAllBlocks()[0];
+        const parsedB = parsedAdd.getDataInput("b")!;
+        expect((parsedB as any)._defaultValue).toBe(42);
+
+        // Verify context survived
+        expect(parsedGraph.contextCount).toBe(1);
+        const parsedCtx = parsedGraph.getContext(0);
+        expect(parsedCtx.name).toBe("TestContext");
+        expect(parsedCtx.getVariable("myVar")).toBe(123);
+        expect(parsedCtx.getVariableType("myVar")).toBe("number");
+
+        // Serialize again (simulating save-after-load)
+        const serialized2: any = {};
+        parsedGraph.serialize(serialized2);
+
+        expect(serialized2.executionContexts.length).toBe(1);
+        expect(serialized2.executionContexts[0].name).toBe("TestContext");
+        expect(serialized2.executionContexts[0]._variableTypes).toEqual({ myVar: "number" });
+        const serializedBInput2 = serialized2.allBlocks[0].dataInputs.find((i: any) => i.name === "b");
+        expect(serializedBInput2.defaultValue).toBe(42);
+    });
+
+    it("Contexts survive when graph is not started (editor scenario)", async () => {
+        const coordinator = new FlowGraphCoordinator({ scene });
+        const graph = coordinator.createGraph();
+
+        const addBlock = new FlowGraphAddBlock({ typeName: "number" });
+        graph.addBlock(addBlock);
+
+        const ctx = graph.createContext();
+        ctx.setVariable("speed", 5);
+        ctx.setVariableType("speed", "number");
+        ctx.name = "MyContext";
+
+        // Serialize (graph was never started — this is the editor scenario)
+        const serialized: any = {};
+        graph.serialize(serialized);
+        expect(serialized.executionContexts.length).toBe(1);
+        expect(serialized.executionContexts[0]._userVariables.speed).toBe(5);
+
+        // Parse into a new graph
+        const coordinator2 = new FlowGraphCoordinator({ scene });
+        const parsed = await ParseFlowGraphAsync(serialized, { coordinator: coordinator2 });
+
+        // The parsed graph should have the context
+        expect(parsed.contextCount).toBe(1);
+        expect(parsed.getContext(0).getVariable("speed")).toBe(5);
+
+        // Simulate the editor's setScene clearing contexts (different scene)
+        const scene2 = new Scene(engine);
+        parsed.setScene(scene2);
+
+        // After setScene with a different scene, contexts are gone
+        expect(parsed.contextCount).toBe(0);
+
+        // Serialize — this is the bug scenario (save after reload)
+        const serialized2: any = {};
+        parsed.serialize(serialized2);
+        // Without the editor's snapshot injection, contexts are lost
+        expect(serialized2.executionContexts.length).toBe(0);
+        scene2.dispose();
+    });
+
+    it("Editor snapshot mechanism preserves contexts across setScene", async () => {
+        // Simulate the full editor lifecycle:
+        // 1. Create graph with context+variables (user builds a graph)
+        // 2. Serialize (first save)
+        // 3. Parse back (load from file)
+        // 4. Snapshot contexts, then setScene clears them (editor setter)
+        // 5. Serialize again (second save) using snapshot injection
+
+        const coordinator = new FlowGraphCoordinator({ scene });
+        const graph = coordinator.createGraph();
+
+        const addBlock = new FlowGraphAddBlock({ typeName: "number" });
+        graph.addBlock(addBlock);
+
+        const ctx = graph.createContext();
+        ctx.setVariable("speed", 5);
+        ctx.setVariableType("speed", "number");
+        ctx.name = "PlayerCtx";
+
+        // --- Step 2: First save ---
+        const firstSave: any = {};
+        graph.serialize(firstSave);
+        const firstSaveJSON = JSON.parse(JSON.stringify(firstSave));
+        expect(firstSaveJSON.executionContexts.length).toBe(1);
+        expect(firstSaveJSON.executionContexts[0]._userVariables.speed).toBe(5);
+
+        // --- Step 3: Load from file (parse the JSON) ---
+        const coordinator2 = new FlowGraphCoordinator({ scene });
+        const parsed = await ParseFlowGraphAsync(firstSaveJSON, { coordinator: coordinator2 });
+        expect(parsed.contextCount).toBe(1);
+        expect(parsed.getContext(0).getVariable("speed")).toBe(5);
+
+        // --- Step 4: Editor setter — snapshot before setScene clears ---
+        // This mimics what globalState.set flowGraph() does
+        const savedContextSnapshots: any[] = [];
+        for (let i = 0; i < parsed.contextCount; i++) {
+            const context = parsed.getContext(i);
+            const serialized: any = {};
+            context.serialize(serialized);
+            savedContextSnapshots.push(serialized);
+        }
+
+        // setScene with a DIFFERENT scene clears contexts
+        const previewScene = new Scene(engine);
+        parsed.setScene(previewScene);
+        expect(parsed.contextCount).toBe(0);
+
+        // --- Step 5: Second save (serialize + inject snapshots) ---
+        const secondSave: any = {};
+        parsed.serialize(secondSave);
+        // Live contexts are empty, so inject snapshots
+        expect(secondSave.executionContexts.length).toBe(0);
+        if (secondSave.executionContexts.length === 0 && savedContextSnapshots.length > 0) {
+            secondSave.executionContexts = savedContextSnapshots;
+        }
+
+        // Verify the second save has the same context data
+        const secondSaveJSON = JSON.parse(JSON.stringify(secondSave));
+        expect(secondSaveJSON.executionContexts.length).toBe(1);
+        expect(secondSaveJSON.executionContexts[0].name).toBe("PlayerCtx");
+        expect(secondSaveJSON.executionContexts[0]._userVariables.speed).toBe(5);
+        expect(secondSaveJSON.executionContexts[0]._variableTypes).toEqual({ speed: "number" });
+
+        // --- Verify the second save can be parsed again ---
+        const coordinator3 = new FlowGraphCoordinator({ scene });
+        const reParsed = await ParseFlowGraphAsync(secondSaveJSON, { coordinator: coordinator3 });
+        expect(reParsed.contextCount).toBe(1);
+        expect(reParsed.getContext(0).getVariable("speed")).toBe(5);
+        expect(reParsed.getContext(0).getVariableType("speed")).toBe("number");
+        expect(reParsed.getContext(0).name).toBe("PlayerCtx");
+
+        previewScene.dispose();
+    });
+
+    it("Multiple contexts with different variables round-trip correctly", async () => {
+        const coordinator = new FlowGraphCoordinator({ scene });
+        const graph = coordinator.createGraph();
+
+        const getVarBlock = new FlowGraphGetVariableBlock({ variable: "target" });
+        graph.addBlock(getVarBlock);
+
+        // Create two contexts with different mesh descriptors
+        const ctx0 = graph.createContext();
+        ctx0.name = "Context 0";
+        ctx0.setVariable("target", { id: "box", name: "box", className: "Mesh", uniqueId: 8 });
+        ctx0.setVariableType("target", "Mesh");
+
+        const ctx1 = graph.createContext();
+        ctx1.name = "Context 1";
+        ctx1.setVariable("target", { id: "sphere", name: "sphere", className: "Mesh", uniqueId: 11 });
+        ctx1.setVariableType("target", "Mesh");
+
+        // Serialize
+        const serialized: any = {};
+        graph.serialize(serialized);
+        const json = JSON.parse(JSON.stringify(serialized));
+
+        expect(json.executionContexts.length).toBe(2);
+        expect(json.executionContexts[0].name).toBe("Context 0");
+        expect(json.executionContexts[0]._userVariables.target.name).toBe("box");
+        expect(json.executionContexts[0]._variableTypes.target).toBe("Mesh");
+        expect(json.executionContexts[1].name).toBe("Context 1");
+        expect(json.executionContexts[1]._userVariables.target.name).toBe("sphere");
+
+        // Parse back
+        const coordinator2 = new FlowGraphCoordinator({ scene });
+        const parsed = await ParseFlowGraphAsync(json, { coordinator: coordinator2 });
+        expect(parsed.contextCount).toBe(2);
+        expect(parsed.getContext(0).name).toBe("Context 0");
+        expect(parsed.getContext(0).getVariableType("target")).toBe("Mesh");
+        expect(parsed.getContext(1).name).toBe("Context 1");
+        expect(parsed.getContext(1).getVariableType("target")).toBe("Mesh");
+    });
+
+    it("Connection values round-trip through serialize and parse", async () => {
+        const coordinator = new FlowGraphCoordinator({ scene });
+        const graph = coordinator.createGraph();
+
+        const addBlock = new FlowGraphAddBlock({ typeName: "number" });
+        graph.addBlock(addBlock);
+
+        const ctx = graph.createContext();
+        // Set connection values (unconnected input defaults)
+        const outputId = addBlock.getDataOutput("value")!.uniqueId;
+        ctx._setConnectionValueByKey(outputId, 42.5);
+
+        // Serialize
+        const serialized: any = {};
+        graph.serialize(serialized);
+        const json = JSON.parse(JSON.stringify(serialized));
+
+        expect(json.executionContexts[0]._connectionValues[outputId]).toBe(42.5);
+
+        // Parse back
+        const coordinator2 = new FlowGraphCoordinator({ scene });
+        const parsed = await ParseFlowGraphAsync(json, { coordinator: coordinator2 });
+        const parsedCtx = parsed.getContext(0);
+        expect((parsedCtx as any)._connectionValues[outputId]).toBe(42.5);
+    });
+
+    it("Variable types persist through serialize → parse → serialize cycle", async () => {
+        const coordinator = new FlowGraphCoordinator({ scene });
+        const graph = coordinator.createGraph();
+        graph.addBlock(new FlowGraphGetVariableBlock({ variable: "health" }));
+
+        const ctx = graph.createContext();
+        ctx.setVariable("health", 100);
+        ctx.setVariableType("health", "number");
+        ctx.setVariable("alive", true);
+        ctx.setVariableType("alive", "boolean");
+
+        // First serialize
+        const s1: any = {};
+        graph.serialize(s1);
+        const j1 = JSON.parse(JSON.stringify(s1));
+        expect(j1.executionContexts[0]._variableTypes).toEqual({ health: "number", alive: "boolean" });
+
+        // Parse
+        const c2 = new FlowGraphCoordinator({ scene });
+        const parsed = await ParseFlowGraphAsync(j1, { coordinator: c2 });
+        expect(parsed.getContext(0).getVariableType("health")).toBe("number");
+        expect(parsed.getContext(0).getVariableType("alive")).toBe("boolean");
+
+        // Second serialize
+        const s2: any = {};
+        parsed.serialize(s2);
+        expect(s2.executionContexts[0]._variableTypes).toEqual({ health: "number", alive: "boolean" });
+    });
+
+    it("Multi-context snapshot + inject preserves all contexts", async () => {
+        const coordinator = new FlowGraphCoordinator({ scene });
+        const graph = coordinator.createGraph();
+        graph.addBlock(new FlowGraphGetVariableBlock({ variable: "mesh" }));
+
+        const ctx0 = graph.createContext();
+        ctx0.name = "Ctx0";
+        ctx0.setVariable("mesh", 10);
+        ctx0.setVariableType("mesh", "number");
+
+        const ctx1 = graph.createContext();
+        ctx1.name = "Ctx1";
+        ctx1.setVariable("mesh", 20);
+        ctx1.setVariableType("mesh", "number");
+
+        // Serialize first
+        const firstSave: any = {};
+        graph.serialize(firstSave);
+        const json = JSON.parse(JSON.stringify(firstSave));
+
+        // Parse
+        const c2 = new FlowGraphCoordinator({ scene });
+        const parsed = await ParseFlowGraphAsync(json, { coordinator: c2 });
+        expect(parsed.contextCount).toBe(2);
+
+        // Snapshot all contexts (editor lifecycle)
+        const snapshots: any[] = [];
+        for (let i = 0; i < parsed.contextCount; i++) {
+            const s: any = {};
+            parsed.getContext(i).serialize(s);
+            snapshots.push(s);
+        }
+
+        // setScene clears contexts
+        const scene2 = new Scene(engine);
+        parsed.setScene(scene2);
+        expect(parsed.contextCount).toBe(0);
+
+        // Serialize with injection
+        const secondSave: any = {};
+        parsed.serialize(secondSave);
+        secondSave.executionContexts = snapshots;
+
+        // Verify both contexts survived
+        expect(secondSave.executionContexts.length).toBe(2);
+        expect(secondSave.executionContexts[0].name).toBe("Ctx0");
+        expect(secondSave.executionContexts[0]._userVariables.mesh).toBe(10);
+        expect(secondSave.executionContexts[0]._variableTypes).toEqual({ mesh: "number" });
+        expect(secondSave.executionContexts[1].name).toBe("Ctx1");
+        expect(secondSave.executionContexts[1]._userVariables.mesh).toBe(20);
+
+        // Parse the injected JSON
+        const c3 = new FlowGraphCoordinator({ scene });
+        const reParsed = await ParseFlowGraphAsync(secondSave, { coordinator: c3 });
+        expect(reParsed.contextCount).toBe(2);
+        expect(reParsed.getContext(0).getVariable("mesh")).toBe(10);
+        expect(reParsed.getContext(1).getVariable("mesh")).toBe(20);
+
+        scene2.dispose();
+    });
+
+    it("Unresolved mesh descriptors survive as objects through serialization", () => {
+        // When a mesh can't be found during parsing, the descriptor stays as a
+        // plain object. Verify it serializes correctly so PreserveUnresolvedVariables
+        // can patch it back.
+        const coordinator = new FlowGraphCoordinator({ scene });
+        const graph = coordinator.createGraph();
+
+        const ctx = graph.createContext();
+        // Simulate an unresolved mesh reference (descriptor object, not actual Mesh)
+        const descriptor = { id: "box", name: "box", className: "Mesh", uniqueId: 8 };
+        ctx.setVariable("target", descriptor);
+        ctx.setVariableType("target", "Mesh");
+
+        const serialized: any = {};
+        graph.serialize(serialized);
+        const json = JSON.parse(JSON.stringify(serialized));
+
+        // The descriptor should be serialized as-is (it's a plain JSON object)
+        expect(json.executionContexts[0]._userVariables.target).toEqual({
+            id: "box",
+            name: "box",
+            className: "Mesh",
+            uniqueId: 8,
+        });
+        expect(json.executionContexts[0]._variableTypes.target).toBe("Mesh");
+    });
+});

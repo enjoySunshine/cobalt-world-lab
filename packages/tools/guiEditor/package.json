@@ -1,0 +1,37 @@
+{
+    "name": "@tools/gui-editor",
+    "private": true,
+    "version": "1.0.0",
+    "files": [
+        "dist"
+    ],
+    "types": "dist/index.d.ts",
+    "main": "dist/index.js",
+    "module": "dist/index.js",
+    "scripts": {
+        "build": "npm run clean && npm run compile",
+        "build:declaration": "build-tools -c pud --config ./config.json",
+        "build:deployment": "npm run clean && vite build",
+        "compile": "tsc -b tsconfig.build.json --verbose",
+        "postcompile": "build-tools -c pa",
+        "serve": "vite",
+        "clean": "rimraf dist && rimraf *.tsbuildinfo -g"
+    },
+    "dependencies": {
+        "react": "^18.3.1",
+        "react-dom": "^18.3.1"
+    },
+    "devDependencies": {
+        "@dev/build-tools": "1.0.0",
+        "@dev/core": "1.0.0",
+        "@dev/gui": "1.0.0",
+        "@dev/shared-ui-components": "1.0.0",
+        "@fortawesome/fontawesome-svg-core": "^7.3.1",
+        "@fortawesome/free-solid-svg-icons": "^7.3.1",
+        "@fortawesome/react-fontawesome": "^3.5.0",
+        "@types/dagre": "^0.7.54",
+        "@types/react": "^18.3.31",
+        "@types/react-dom": "^18.3.7"
+    },
+    "sideEffects": true
+}

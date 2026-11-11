@@ -1,0 +1,61 @@
+import { type Vector2 } from "core/Maths/math.vector";
+
+/**
+ * Options for loading OBJ/MTL files
+ */
+export type OBJLoadingOptions = {
+    /**
+     * Defines the character encoding used to decode OBJ and MTL files.
+     * Use "auto" to detect UTF-8/UTF-16 and fall back to GB18030, or provide an encoding label supported by TextDecoder.
+     * Defaults to "auto".
+     */
+    encoding?: string;
+    /**
+     * Defines if UVs are optimized by default during load.
+     */
+    optimizeWithUV: boolean;
+    /**
+     * Defines custom scaling of UV coordinates of loaded meshes.
+     */
+    // eslint-disable-next-line @typescript-eslint/naming-convention
+    UVScaling: Vector2;
+    /**
+     * Invert model on y-axis (does a model scaling inversion)
+     */
+    invertY: boolean;
+    /**
+     * Invert Y-Axis of referenced textures on load
+     */
+    invertTextureY: boolean;
+    /**
+     * Wait for referenced textures to finish loading before completing the OBJ load.
+     * When enabled, texture loading failures follow materialLoadingFailsSilently.
+     * Defaults to false for backwards compatibility.
+     */
+    waitForTextures?: boolean;
+    /**
+     * Include in meshes the vertex colors available in some OBJ files.  This is not part of OBJ standard.
+     */
+    importVertexColors: boolean;
+    /**
+     * Compute the normals for the model, even if normals are present in the file.
+     */
+    computeNormals: boolean;
+    /**
+     * Optimize the normals for the model. Lighting can be uneven if you use OptimizeWithUV = true because new vertices can be created for the same location if they pertain to different faces.
+     * Using OptimizehNormals = true will help smoothing the lighting by averaging the normals of those vertices.
+     */
+    optimizeNormals: boolean;
+    /**
+     * Skip loading the materials even if defined in the OBJ file (materials are ignored).
+     */
+    skipMaterials: boolean;
+    /**
+     * When a material fails to load OBJ loader will silently fail and onSuccess() callback will be triggered.
+     */
+    materialLoadingFailsSilently: boolean;
+    /**
+     * Loads assets without handedness conversions. This flag is for compatibility. Use it only if absolutely required. Defaults to false.
+     */
+    useLegacyBehavior: boolean;
+};

@@ -1,0 +1,34 @@
+{
+    "name": "@tools/smart-filters-debugger",
+    "private": true,
+    "version": "0.1.0",
+    "description": "A browser extension to allow for debugging Babylon.js Smart Filters in websites",
+    "license": "MIT",
+    "readme": "README.md",
+    "sideEffects": false,
+    "files": [
+        "dist",
+        "src",
+        "license.md",
+        "readme.md"
+    ],
+    "scripts": {
+        "clean": "rimraf dist && rimraf tsconfig.build.tsbuildinfo",
+        "build": "npm run clean && npm run compile",
+        "compile": "rollup -c rollup.config.umd.mjs --environment ROLLUP_MODE:production",
+        "watch": "rollup -c rollup.config.umd.mjs --watch"
+    },
+    "devDependencies": {
+        "@babylonjs/smart-filters-lite": "1.26.1",
+        "@fortawesome/fontawesome-svg-core": "^7.3.1",
+        "@fortawesome/free-solid-svg-icons": "^7.3.1",
+        "@fortawesome/react-fontawesome": "^3.5.0",
+        "@tools/smart-filters-editor-control": "^1.0.0",
+        "@types/chrome": "^0.3.6",
+        "@types/react": "18.3.31",
+        "@types/react-dom": "18.3.7",
+        "react": "18.3.1",
+        "react-dom": "18.3.1",
+        "sass": "^1.106.1"
+    }
+}

@@ -1,0 +1,74 @@
+import typescript from "@rollup/plugin-typescript";
+import { nodeResolve } from "@rollup/plugin-node-resolve";
+import commonjs from "@rollup/plugin-commonjs";
+import alias from "@rollup/plugin-alias";
+import path from "path";
+import { rewriteDevImports, appendJsToExternalPaths } from "../../rollupUtils.mjs";
+
+// Map dev package names to their public @babylonjs/ equivalents.
+// Must be ordered longest-first to prevent prefix collisions (e.g. gui vs gui-editor).
+const devPackageMap = {
+    "node-render-graph-editor/nodeRenderGraphEditor": "@babylonjs/node-render-graph-editor",
+    "node-geometry-editor/nodeGeometryEditor": "@babylonjs/node-geometry-editor",
+    "node-particle-editor/nodeParticleEditor": "@babylonjs/node-particle-editor",
+    "node-editor/nodeEditor": "@babylonjs/node-editor",
+    "gui-editor/guiEditor": "@babylonjs/gui-editor",
+    "shared-ui-components": null, // handled by alias plugin below
+    serializers: "@babylonjs/serializers",
+    materials: "@babylonjs/materials",
+    loaders: "@babylonjs/loaders",
+    addons: "@babylonjs/addons",
+    core: "@babylonjs/core",
+    gui: "@babylonjs/gui",
+};
+
+const commonConfig = {
+    external: (id) => {
+        // Check for @babylonjs packages (transformed by TypeScript) - these should be external
+        if (/^@babylonjs\//.test(id)) {
+            return true;
+        }
+
+        // Check for Fluent UI packages (including @fluentui-contrib)
+        if (/^@fluentui(-contrib)?\//.test(id)) {
+            return true;
+        }
+
+        // Check for React packages (including sub-paths like react/jsx-runtime)
+        if (id === "react" || id === "react-dom" || id.startsWith("react/") || id.startsWith("react-dom/")) {
+            return true;
+        }
+
+        // Check for other external packages
+        if (id === "usehooks-ts") {
+            return true;
+        }
+
+        return false;
+    },
+};
+
+const createJsConfig = (input, dir) => ({
+    ...commonConfig,
+    input,
+    output: {
+        dir,
+        sourcemap: true,
+        format: "es",
+        exports: "named",
+        paths: appendJsToExternalPaths,
+    },
+    plugins: [
+        rewriteDevImports(devPackageMap),
+        alias({ entries: [{ find: "shared-ui-components", replacement: path.resolve("../../../dev/sharedUiComponents/src") }] }),
+        typescript({ tsconfig: "tsconfig.build.lib.json", compilerOptions: { outDir: dir } }),
+        nodeResolve({ mainFields: ["browser", "module", "main"] }),
+        commonjs(),
+    ],
+    onwarn(warning) {
+        // Treat all warnings as errors.
+        throw new Error(warning.message);
+    },
+});
+
+export default [createJsConfig("../../../dev/inspector-v2/src/index.ts", "lib"), createJsConfig("../../../dev/inspector-v2/src/lite/index.ts", "lib/lite")];

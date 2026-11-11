@@ -1,0 +1,1455 @@
+import { type Scene } from "../../scene";
+import { type IProceduralTextureCreationOptions } from "core/Materials/Textures/Procedurals/proceduralTexture";
+import { ProceduralTexture } from "./Procedurals/proceduralTexture.pure";
+import { type BaseTexture } from "./baseTexture";
+import { type Nullable } from "../../types";
+import { type Texture } from "./texture";
+import { type TextureSize } from "./textureCreationOptions";
+import { ShaderLanguage } from "core/Materials/shaderLanguage";
+import { Constants } from "../../Engines/constants";
+import { Color4 } from "core/Maths/math.color.pure";
+import { _AllTransformsMatch, _CopyTextureMetadata, _HasNonIdentityTransform, _KeepMatchingCoordinates } from "./textureSampling.functions";
+
+const _ShaderName = "textureProcessor";
+
+/**
+ * Specifies the color space of a texture operand.
+ * When `sRGB` is set the sampled RGB values are converted to linear space before any channel
+ * swizzle, factor multiplication, or arithmetic operation. Alpha is always treated as linear.
+ */
+export enum TextureColorSpace {
+    /** Texture data is already in linear space (default). No conversion applied. */
+    Linear = 0,
+    /** Texture data is in sRGB (gamma) space. RGB channels are linearized (IEC 61966-2-1) before use. */
+    SRGB = 1,
+}
+
+/**
+ * Bitmask controlling which channels are written to the output texture by a processing operation.
+ * Channels excluded from the mask receive a sensible default: `0.0` for RGB channels, `1.0` for alpha.
+ * Use `ChannelMask.RGBA` (or omit the parameter) to pass all channels through unchanged.
+ *
+ * | Flag | Channels written | Excluded channels |
+ * |------|-----------------|-------------------|
+ * | R    | red             | G=0, B=0, A=1     |
+ * | G    | green           | R=0, B=0, A=1     |
+ * | B    | blue            | R=0, G=0, A=1     |
+ * | A    | alpha           | R=0, G=0, B=0     |
+ * | RGB  | red, green, blue | A=1              |
+ * | RGBA | all four        | (none)            |
+ */
+export enum ChannelMask {
+    /** Pass only the red channel; G=0, B=0, A=1. */
+    R = 0x1,
+    /** Pass only the green channel; R=0, B=0, A=1. */
+    G = 0x2,
+    /** Pass only the blue channel; R=0, G=0, A=1. */
+    B = 0x4,
+    /** Pass only the alpha channel; R=0, G=0, B=0. */
+    A = 0x8,
+    /** Pass red, green, and blue; alpha is forced to 1.0. */
+    RGB = 0x7,
+    /** Pass all four channels unchanged (default — no masking). */
+    RGBA = 0xf,
+}
+
+/**
+ * Specifies which channel of a texture to read for an operation.
+ * When a single channel is selected its scalar value is broadcast to RGB; alpha
+ * is either preserved from the original sample or replicated when `A` is chosen.
+ *
+ * | Value | Swizzle |
+ * |-------|---------|
+ * | RGBA  | (r, g, b, a) — no swizzle (default) |
+ * | R     | (r, r, r, a) |
+ * | G     | (g, g, g, a) |
+ * | B     | (b, b, b, a) |
+ * | A     | (a, a, a, a) |
+ */
+export enum TextureChannel {
+    /** Use all four channels as sampled (default). */
+    RGBA = 0,
+    /** Broadcast the red channel to RGB; preserve alpha: RRRA. */
+    R = 1,
+    /** Broadcast the green channel to RGB; preserve alpha: GGGA. */
+    G = 2,
+    /** Broadcast the blue channel to RGB; preserve alpha: BBBA. */
+    B = 3,
+    /** Broadcast the alpha channel to all four components: AAAA. */
+    A = 4,
+}
+
+/**
+ * Represents an operand for a texture processing operation, or the result of one.
+ *
+ * As an operand, the value evaluates to a vec4 per texel:
+ * - `texture` only → `sample(texture)`
+ * - `factor` only → `factor` (constant)
+ * - both → `sample(texture) * factor`
+ *
+ * As a result returned by a processing function:
+ * - `texture` holds the GPU-processed output; `dispose()` releases it when no longer needed.
+ * - `factor` holds a CPU-folded constant when all inputs were texture-free; no `dispose` is set.
+ *
+ * Results are directly usable as operands to subsequent operations. When a result with a
+ * `dispose` function is passed as an operand, the next operation automatically calls `dispose`
+ * after consuming it, so intermediate textures are cleaned up without manual tracking.
+ *
+ * At least one of `texture` or `factor` must be provided when used as an operand.
+ */
+export interface ITextureProcessOperand {
+    /**
+     * Texture to sample. When combined with `factor`, the sampled value is multiplied
+     * component-wise by the factor. Null when the operand or result is a constant.
+     */
+    texture: Nullable<BaseTexture>;
+    /**
+     * Optional constant RGBA factor. If `texture` is also set, the sampled value is
+     * multiplied by this factor. If `texture` is not set, this becomes the constant output.
+     * When omitted and `texture` is set, defaults to (1, 1, 1, 1) — no scaling.
+     */
+    factor?: Color4;
+    /**
+     * Optional channel selection applied to the sampled texture value before any factor
+     * multiplication. When omitted or set to `TextureChannel.RGBA`, the sample is used
+     * as-is. When set to a single channel, that channel's scalar is broadcast to RGB
+     * (or all four components for `TextureChannel.A`). Only meaningful when `texture` is set.
+     */
+    channel?: TextureChannel;
+
+    /**
+     * Color space of the texture data. When set to `TextureColorSpace.SRGB`, the sampled
+     * RGB channels are converted from sRGB to linear space (IEC 61966-2-1) before the channel
+     * swizzle, factor multiplication, and any arithmetic operation. Alpha is always linear.
+     * Defaults to `TextureColorSpace.Linear` (no conversion). Only meaningful when `texture` is set.
+     */
+    colorSpace?: TextureColorSpace;
+
+    /**
+     * Disposes the texture produced by a processing operation. Only present on results
+     * returned by the texture processing functions. When a result is passed as an operand
+     * to the next operation in a chain, its `dispose` is called automatically after the
+     * GPU pass completes. Call `dispose` explicitly on the final result when the texture
+     * is no longer needed (or skip it if transferring ownership to a material).
+     */
+    dispose?: () => void;
+}
+
+/**
+ * Controls the GPU texture created by a texture processing operation.
+ */
+export interface ITextureProcessorOutputOptions {
+    /**
+     * Texture type used by the render target. Defaults to `Constants.TEXTURETYPE_UNSIGNED_BYTE`.
+     */
+    textureType?: number;
+    /**
+     * Sampling mode used by the output texture. Defaults to `Constants.TEXTURE_BILINEAR_SAMPLINGMODE`.
+     */
+    samplingMode?: number;
+    /**
+     * Whether mipmaps are generated for the output texture. Defaults to `false`.
+     */
+    generateMipMaps?: boolean;
+}
+
+/**
+ * Create an operand from a texture alone (no constant factor scaling).
+ * @param texture - The texture to sample, or null to produce an identity (1,1,1,1) constant operand
+ * @param channel - Optional channel selection. When set, the sampled value is swizzled before use
+ *   (e.g. `TextureChannel.R` → RRRA). Defaults to `TextureChannel.RGBA` (no swizzle).
+ * @param colorSpace - Optional color space. When `TextureColorSpace.SRGB`, the sampled RGB channels
+ *   are linearized before use. Defaults to `TextureColorSpace.Linear`.
+ * @returns An operand that evaluates to the sampled texture value
+ */
+export function CreateTextureOperand(texture: Nullable<BaseTexture>, channel?: TextureChannel, colorSpace?: TextureColorSpace): ITextureProcessOperand {
+    const op: ITextureProcessOperand = { texture };
+    if (channel) {
+        op.channel = channel;
+    }
+    if (colorSpace) {
+        op.colorSpace = colorSpace;
+    }
+    return op;
+}
+
+/**
+ * Create an operand from a constant RGBA factor with no texture.
+ * @param factor - The constant RGBA value
+ * @returns An operand that evaluates to the constant factor
+ */
+export function CreateFactorOperand(factor: Color4): ITextureProcessOperand {
+    return { texture: null, factor };
+}
+
+/**
+ * Create an operand from a texture multiplied by a constant RGBA factor.
+ * This is the standard glTF pattern (e.g. baseColorTexture * baseColorFactor).
+ * If `texture` is null, returns a factor-only operand.
+ * @param texture - The texture to sample, or null to use the factor alone
+ * @param factor - The constant factor to multiply by
+ * @param channel - Optional channel selection. When set, the sampled value is swizzled before
+ *   factor multiplication (e.g. `TextureChannel.G` → GGGA, then multiplied by factor).
+ *   Defaults to `TextureChannel.RGBA` (no swizzle).
+ * @param colorSpace - Optional color space. When `TextureColorSpace.SRGB`, the sampled RGB channels
+ *   are linearized before factor multiplication. Defaults to `TextureColorSpace.Linear`.
+ * @returns An operand that evaluates to `sample(texture) * factor`, or `factor` if texture is null
+ */
+export function CreateTextureWithFactorOperand(texture: Nullable<BaseTexture>, factor: Color4, channel?: TextureChannel, colorSpace?: TextureColorSpace): ITextureProcessOperand {
+    const op: ITextureProcessOperand = { texture, factor };
+    if (channel) {
+        op.channel = channel;
+    }
+    if (colorSpace) {
+        op.colorSpace = colorSpace;
+    }
+    return op;
+}
+
+/**
+ * @internal
+ * Evaluate the effective constant Color4 of an operand.
+ * When a texture-only operand omits factor, the implicit value is (1, 1, 1, 1).
+ */
+function _EvalConstant(op: ITextureProcessOperand): Color4 {
+    return op.factor ?? new Color4(1, 1, 1, 1);
+}
+
+/** @internal */
+function _MultiplyConstants(a: Color4, b: Color4): Color4 {
+    return new Color4(a.r * b.r, a.g * b.g, a.b * b.b, a.a * b.a);
+}
+
+/** @internal */
+function _MaxConstants(a: Color4, b: Color4): Color4 {
+    return new Color4(Math.max(a.r, b.r), Math.max(a.g, b.g), Math.max(a.b, b.b), Math.max(a.a, b.a));
+}
+
+/** @internal */
+function _DivideConstants(a: Color4, b: Color4): Color4 {
+    const eps = 0.00001;
+    return new Color4(a.r / Math.max(b.r, eps), a.g / Math.max(b.g, eps), a.b / Math.max(b.b, eps), a.a / Math.max(b.a, eps));
+}
+
+/** @internal */
+function _LerpConstants(a: Color4, b: Color4, t: Color4): Color4 {
+    return new Color4(a.r + (b.r - a.r) * t.r, a.g + (b.g - a.g) * t.g, a.b + (b.b - a.b) * t.b, a.a + (b.a - a.a) * t.a);
+}
+
+/**
+ * Clamps a scatter anisotropy the same way the renderer does before converting between single- and
+ * multi-scatter albedo, so that |aniso| = 1 doesn't collapse the conversion.
+ * @internal
+ */
+function _EffectiveScatterAnisotropy(aniso: number): number {
+    return Math.min(Math.max(aniso, -0.9999), 0.9999);
+}
+
+/** @internal */
+function _MultiScatterToSingleScatterAlbedoConstant(multiScatter: Color4, aniso: number): Color4 {
+    const convert = (value: number) => {
+        const rhoMs = Math.min(Math.max(value, 0), 1);
+        let s = 4.09712 + 4.20863 * rhoMs - Math.sqrt(9.59217 + 41.6808 * rhoMs + 17.7126 * rhoMs * rhoMs);
+        if (rhoMs === 0) {
+            s = 1;
+        }
+        return (1 - s * s) / Math.max(1 - aniso * s * s, 0.0000001);
+    };
+    return new Color4(convert(multiScatter.r), convert(multiScatter.g), convert(multiScatter.b), multiScatter.a);
+}
+
+/** @internal */
+function _SingleScatterToMultiScatterAlbedoConstant(singleScatter: Color4, aniso: number): Color4 {
+    const convert = (value: number) => {
+        const ssAlbedo = Math.min(Math.max(value, 0), 1);
+        const s = Math.sqrt(Math.max((1 - ssAlbedo) / Math.max(1 - aniso * ssAlbedo, 0.0000001), 0));
+        return ((1 - s) * (1 - 0.139 * s)) / (1 + 1.17 * s);
+    };
+    return new Color4(convert(singleScatter.r), convert(singleScatter.g), convert(singleScatter.b), singleScatter.a);
+}
+
+/**
+ * @internal
+ * Determine the output texture size from a list of operands, using the largest input texture.
+ */
+function _ResolveOutputSize(operands: ITextureProcessOperand[]): TextureSize {
+    let maxDim = 0;
+    let result: TextureSize = 512;
+    for (const op of operands) {
+        if (op.texture) {
+            const size = op.texture.getSize();
+            const dim = Math.max(size.width, size.height);
+            if (dim > maxDim) {
+                maxDim = dim;
+                result = size.width === size.height ? dim : size;
+            }
+        }
+    }
+    return result;
+}
+
+function _KeepMatchingOperandCoordinates(name: string, operands: ITextureProcessOperand[]): ITextureProcessOperand[] {
+    return _KeepMatchingCoordinates(
+        `Texture processor '${name}'`,
+        operands,
+        (operand) => operand.texture,
+        (operand) => ({ ...operand, texture: null })
+    );
+}
+
+/**
+ * @internal
+ * Return the shader define suffix for a TextureChannel (e.g. TextureChannel.R → "R").
+ * Returns an empty string for RGBA (no swizzle needed).
+ */
+function _ChannelDefine(channel: TextureChannel): string {
+    switch (channel) {
+        case TextureChannel.R:
+            return "R";
+        case TextureChannel.G:
+            return "G";
+        case TextureChannel.B:
+            return "B";
+        case TextureChannel.A:
+            return "A";
+        default:
+            return "";
+    }
+}
+
+/**
+ * @internal
+ * Apply a channel swizzle to a constant Color4, matching the GPU behaviour for TextureChannel.
+ */
+function _ApplyChannelSwizzle(c: Color4, channel: TextureChannel): Color4 {
+    switch (channel) {
+        case TextureChannel.R:
+            return new Color4(c.r, c.r, c.r, c.a);
+        case TextureChannel.G:
+            return new Color4(c.g, c.g, c.g, c.a);
+        case TextureChannel.B:
+            return new Color4(c.b, c.b, c.b, c.a);
+        case TextureChannel.A:
+            return new Color4(c.a, c.a, c.a, c.a);
+        default:
+            return c;
+    }
+}
+
+/**
+ * @internal
+ * Build the OP_INVERT define plus per-channel INVERT_R/G/B/A defines from an ChannelMask bitmask.
+ */
+function _BuildInvertDefines(channels: ChannelMask): string[] {
+    const defines: string[] = ["OP_INVERT"];
+    if (channels & ChannelMask.R) {
+        defines.push("INVERT_R");
+    }
+    if (channels & ChannelMask.G) {
+        defines.push("INVERT_G");
+    }
+    if (channels & ChannelMask.B) {
+        defines.push("INVERT_B");
+    }
+    if (channels & ChannelMask.A) {
+        defines.push("INVERT_A");
+    }
+    return defines;
+}
+
+/**
+ * @internal
+ * Build OUTPUT_MASK_X_ZERO / OUTPUT_MASK_A_ONE defines for excluded channels.
+ * Channels present in the mask pass through; excluded channels get defaults (0.0 for RGB, 1.0 for A).
+ * Returns an empty array for ChannelMask.RGBA (no masking needed).
+ */
+function _BuildOutputChannelMaskDefines(mask: ChannelMask): string[] {
+    const defines: string[] = [];
+    if (!(mask & ChannelMask.R)) {
+        defines.push("OUTPUT_MASK_R_ZERO");
+    }
+    if (!(mask & ChannelMask.G)) {
+        defines.push("OUTPUT_MASK_G_ZERO");
+    }
+    if (!(mask & ChannelMask.B)) {
+        defines.push("OUTPUT_MASK_B_ZERO");
+    }
+    if (!(mask & ChannelMask.A)) {
+        defines.push("OUTPUT_MASK_A_ONE");
+    }
+    return defines;
+}
+
+/**
+ * @internal
+ * Apply a ChannelMask to a constant Color4: included channels pass through,
+ * excluded color channels become 0, excluded alpha becomes 1.
+ */
+function _ApplyOutputChannelMask(c: Color4, mask: ChannelMask): Color4 {
+    return new Color4(mask & ChannelMask.R ? c.r : 0, mask & ChannelMask.G ? c.g : 0, mask & ChannelMask.B ? c.b : 0, mask & ChannelMask.A ? c.a : 1);
+}
+
+/**
+ * @internal
+ * Build shader defines for a standard A/B operand.
+ * When `bakeTransform` is true and the texture has a non-identity UV transform,
+ * the OPERAND_X_MATRIX define is emitted so the shader applies the matrix when sampling.
+ */
+function _BuildOperandDefines(operand: ITextureProcessOperand, prefix: "A" | "B", bakeTransform: boolean): string[] {
+    const defines: string[] = [];
+    if (operand.texture) {
+        defines.push(`OPERAND_${prefix}_TEXTURE`);
+        if (bakeTransform && _HasNonIdentityTransform(operand.texture)) {
+            defines.push(`OPERAND_${prefix}_MATRIX`);
+        }
+        if (operand.colorSpace) {
+            defines.push(`OPERAND_${prefix}_SRGB`);
+        }
+        if (operand.channel) {
+            defines.push(`OPERAND_${prefix}_CHANNEL_${_ChannelDefine(operand.channel)}`);
+        }
+    }
+    if (operand.factor !== undefined || !operand.texture) {
+        defines.push(`OPERAND_${prefix}_FACTOR`);
+    }
+    return defines;
+}
+
+/**
+ * @internal
+ * Build shader defines for the lerp blend operand.
+ * When `bakeTransform` is true and the texture has a non-identity UV transform,
+ * the LERP_T_MATRIX define is emitted.
+ */
+function _BuildLerpBlendDefines(t: ITextureProcessOperand, bakeTransform: boolean): string[] {
+    const defines: string[] = [];
+    if (t.texture) {
+        defines.push("LERP_T_TEXTURE");
+        if (bakeTransform && _HasNonIdentityTransform(t.texture)) {
+            defines.push("LERP_T_MATRIX");
+        }
+        if (t.factor !== undefined) {
+            defines.push("LERP_T_FACTOR");
+        }
+        if (t.colorSpace) {
+            defines.push("LERP_T_SRGB");
+        }
+        if (t.channel) {
+            defines.push(`LERP_T_CHANNEL_${_ChannelDefine(t.channel)}`);
+        }
+    }
+    // factor-only: no additional defines needed; the shader uses factorT when LERP_T_TEXTURE is absent.
+    return defines;
+}
+
+/**
+ * @internal
+ * Set uniforms and textures for a standard A/B operand on a procedural texture.
+ * When `bakeTransform` is true and the texture has a non-identity UV matrix,
+ * that matrix is uploaded as `<textureName>Matrix` for the shader to apply when sampling.
+ */
+function _SetOperandUniforms(pt: ProceduralTexture, operand: ITextureProcessOperand, textureName: string, factorName: string, bakeTransform: boolean): void {
+    if (operand.texture) {
+        pt.setTexture(textureName, operand.texture as Texture);
+        if (bakeTransform && _HasNonIdentityTransform(operand.texture)) {
+            pt.setMatrix(`${textureName}Matrix`, operand.texture.getTextureMatrix());
+        }
+    }
+    const needsFactor = operand.factor !== undefined || !operand.texture;
+    if (needsFactor) {
+        pt.setColor4(factorName, _EvalConstant(operand));
+    }
+}
+
+/**
+ * @internal
+ * Set uniforms and textures for the lerp blend operand.
+ * When `bakeTransform` is true and the texture has a non-identity UV matrix,
+ * that matrix is uploaded as `textureTMatrix`.
+ */
+function _SetLerpBlendUniforms(pt: ProceduralTexture, t: ITextureProcessOperand, bakeTransform: boolean): void {
+    if (t.texture) {
+        pt.setTexture("textureT", t.texture as Texture);
+        if (bakeTransform && _HasNonIdentityTransform(t.texture)) {
+            pt.setMatrix("textureTMatrix", t.texture.getTextureMatrix());
+        }
+        if (t.factor !== undefined) {
+            pt.setColor4("factorT", t.factor);
+        }
+    } else {
+        pt.setColor4("factorT", _EvalConstant(t));
+    }
+}
+
+/**
+ * @internal
+ * Create a textureProcessor procedural texture with the given defines. The returned texture
+ * is not yet rendered — uniforms must be set on it before calling _RenderAsync.
+ */
+function _CreateProcessorTexture(
+    name: string,
+    defines: string[],
+    outputSize: TextureSize,
+    scene: Scene,
+    outputColorSpace: TextureColorSpace = TextureColorSpace.Linear,
+    outputOptions?: ITextureProcessorOutputOptions
+): ProceduralTexture {
+    const options: IProceduralTextureCreationOptions = {
+        type: outputOptions?.textureType ?? Constants.TEXTURETYPE_UNSIGNED_BYTE,
+        format: Constants.TEXTUREFORMAT_RGBA,
+        samplingMode: outputOptions?.samplingMode ?? Constants.TEXTURE_BILINEAR_SAMPLINGMODE,
+        generateDepthBuffer: false,
+        generateMipMaps: outputOptions?.generateMipMaps ?? false,
+        gammaSpace: outputColorSpace === TextureColorSpace.SRGB,
+        shaderLanguage: scene.getEngine().isWebGPU ? ShaderLanguage.WGSL : ShaderLanguage.GLSL,
+        extraInitializationsAsync: async () => {
+            if (scene.getEngine().isWebGPU) {
+                await Promise.all([import("../../ShadersWGSL/textureProcessor.fragment")]);
+            } else {
+                await Promise.all([import("../../Shaders/textureProcessor.fragment")]);
+            }
+        },
+        // Opt out of scene-managed rendering. _shouldRender() would re-render the texture
+        // on the first scene frame regardless of refreshRate (because _currentRefreshId starts
+        // at -1 and is only advanced by _shouldRender() itself, not by a direct render() call).
+        // That re-render would sample already-disposed input textures, producing blank output.
+        skipSceneRegistration: true,
+    };
+
+    const pt = new ProceduralTexture(name, outputSize, _ShaderName, scene, options);
+    pt.refreshRate = -1; // render on demand only
+    pt.defines = defines.length > 0 ? "#define " + defines.join("\n#define ") + "\n" : "";
+    return pt;
+}
+
+/**
+ * @internal
+ * Wait for a procedural texture's shader to compile then render it. Uniforms must be set
+ * on the texture before calling this.
+ */
+async function _RenderAsync(pt: ProceduralTexture): Promise<void> {
+    return await new Promise<void>((resolve, reject) => {
+        pt.executeWhenReady(() => {
+            try {
+                pt.render();
+                resolve();
+            } catch (error) {
+                reject(error instanceof Error ? error : new Error(String(error)));
+            }
+        });
+    });
+}
+
+/**
+ * Multiply two texture operands together, component-wise: `result = a * b`.
+ *
+ * Each operand can be a texture, a constant factor, or a texture scaled by a factor.
+ * This is useful for applying glTF-style factors to textures (e.g. `baseColorTexture * baseColorFactor`),
+ * or for modulating one texture by another.
+ *
+ * If both operands are constant (no textures), the multiplication is performed on the CPU and
+ * the result is returned as a factor-only operand with no texture allocated.
+ *
+ * When operands are results of previous operations (i.e. they carry a `dispose` function),
+ * their intermediate textures are automatically released after the GPU pass completes.
+ *
+ * @param name - Name for the resulting procedural texture (used only when a GPU pass is needed)
+ * @param a - First operand
+ * @param b - Second operand
+ * @param scene - Scene to create the texture in (used only when a GPU pass is needed)
+ * @param outputColorSpace - Optional output color space. When `TextureColorSpace.SRGB`, the linear
+ *   result is converted to sRGB (IEC 61966-2-1) before being written. Defaults to `TextureColorSpace.Linear`.
+ * @param outputChannelMask - Optional bitmask of channels to write. Excluded color channels are set to
+ *   `0.0`; excluded alpha is set to `1.0`. Defaults to `ChannelMask.RGBA` (all channels written).
+ * @param outputOptions - Optional render-target type, sampling, and mipmap settings.
+ * @returns An operand whose `texture` holds the GPU result, or whose `factor` holds the CPU-folded constant
+ */
+export async function MultiplyTexturesAsync(
+    name: string,
+    a: ITextureProcessOperand,
+    b: ITextureProcessOperand,
+    scene: Scene,
+    outputColorSpace?: TextureColorSpace,
+    outputChannelMask?: ChannelMask,
+    outputOptions?: ITextureProcessorOutputOptions
+): Promise<ITextureProcessOperand> {
+    if (!a.texture && !b.texture) {
+        const factor = _MultiplyConstants(_EvalConstant(a), _EvalConstant(b));
+        return { texture: null, factor: outputChannelMask ? _ApplyOutputChannelMask(factor, outputChannelMask) : factor };
+    }
+
+    [a, b] = _KeepMatchingOperandCoordinates(name, [a, b]);
+    const allTextures: BaseTexture[] = [];
+    if (a.texture) {
+        allTextures.push(a.texture);
+    }
+    if (b.texture) {
+        allTextures.push(b.texture);
+    }
+    const canPropagate = _AllTransformsMatch(allTextures);
+    const bakeTransform = !canPropagate;
+
+    const defines = [
+        ..._BuildOperandDefines(a, "A", bakeTransform),
+        ..._BuildOperandDefines(b, "B", bakeTransform),
+        ...(outputChannelMask ? _BuildOutputChannelMaskDefines(outputChannelMask) : []),
+    ];
+    if (outputColorSpace) {
+        defines.push("OUTPUT_SRGB");
+    }
+    const pt = _CreateProcessorTexture(name, defines, _ResolveOutputSize([a, b]), scene, outputColorSpace, outputOptions);
+    _SetOperandUniforms(pt, a, "textureA", "factorA", bakeTransform);
+    _SetOperandUniforms(pt, b, "textureB", "factorB", bakeTransform);
+    try {
+        await _RenderAsync(pt);
+    } catch (error) {
+        a.dispose?.();
+        b.dispose?.();
+        throw error;
+    }
+
+    a.dispose?.();
+    b.dispose?.();
+
+    _CopyTextureMetadata(allTextures[0], pt, canPropagate);
+    const result: ITextureProcessOperand = { texture: pt, dispose: () => pt.dispose() };
+    if (outputColorSpace) {
+        result.colorSpace = outputColorSpace;
+    }
+    return result;
+}
+
+/**
+ * Take the component-wise maximum of two texture operands: `result = max(a, b)`.
+ *
+ * Each operand can be a texture, a constant factor, or a texture scaled by a factor.
+ * Useful for operations such as combining ambient occlusion maps or taking the
+ * brightest contribution from two sources.
+ *
+ * If both operands are constant (no textures), the operation is performed on the CPU and
+ * the result is returned as a factor-only operand with no texture allocated.
+ *
+ * When operands are results of previous operations (i.e. they carry a `dispose` function),
+ * their intermediate textures are automatically released after the GPU pass completes.
+ *
+ * @param name - Name for the resulting procedural texture (used only when a GPU pass is needed)
+ * @param a - First operand
+ * @param b - Second operand
+ * @param scene - Scene to create the texture in (used only when a GPU pass is needed)
+ * @param outputColorSpace - Optional output color space. When `TextureColorSpace.SRGB`, the linear
+ *   result is converted to sRGB (IEC 61966-2-1) before being written. Defaults to `TextureColorSpace.Linear`.
+ * @param outputChannelMask - Optional bitmask of channels to write. Excluded color channels are set to
+ *   `0.0`; excluded alpha is set to `1.0`. Defaults to `ChannelMask.RGBA` (all channels written).
+ * @param outputOptions - Optional render-target type, sampling, and mipmap settings.
+ * @returns An operand whose `texture` holds the GPU result, or whose `factor` holds the CPU-folded constant
+ */
+export async function MaxTexturesAsync(
+    name: string,
+    a: ITextureProcessOperand,
+    b: ITextureProcessOperand,
+    scene: Scene,
+    outputColorSpace?: TextureColorSpace,
+    outputChannelMask?: ChannelMask,
+    outputOptions?: ITextureProcessorOutputOptions
+): Promise<ITextureProcessOperand> {
+    if (!a.texture && !b.texture) {
+        const factor = _MaxConstants(_EvalConstant(a), _EvalConstant(b));
+        return { texture: null, factor: outputChannelMask ? _ApplyOutputChannelMask(factor, outputChannelMask) : factor };
+    }
+
+    [a, b] = _KeepMatchingOperandCoordinates(name, [a, b]);
+    const allTextures: BaseTexture[] = [];
+    if (a.texture) {
+        allTextures.push(a.texture);
+    }
+    if (b.texture) {
+        allTextures.push(b.texture);
+    }
+    const canPropagate = _AllTransformsMatch(allTextures);
+    const bakeTransform = !canPropagate;
+
+    const defines = [
+        "OP_MAX",
+        ..._BuildOperandDefines(a, "A", bakeTransform),
+        ..._BuildOperandDefines(b, "B", bakeTransform),
+        ...(outputChannelMask ? _BuildOutputChannelMaskDefines(outputChannelMask) : []),
+    ];
+    if (outputColorSpace) {
+        defines.push("OUTPUT_SRGB");
+    }
+    const pt = _CreateProcessorTexture(name, defines, _ResolveOutputSize([a, b]), scene, outputColorSpace, outputOptions);
+    _SetOperandUniforms(pt, a, "textureA", "factorA", bakeTransform);
+    _SetOperandUniforms(pt, b, "textureB", "factorB", bakeTransform);
+    try {
+        await _RenderAsync(pt);
+    } catch (error) {
+        a.dispose?.();
+        b.dispose?.();
+        throw error;
+    }
+
+    a.dispose?.();
+    b.dispose?.();
+
+    _CopyTextureMetadata(allTextures[0], pt, canPropagate);
+    const result: ITextureProcessOperand = { texture: pt, dispose: () => pt.dispose() };
+    if (outputColorSpace) {
+        result.colorSpace = outputColorSpace;
+    }
+    return result;
+}
+
+/**
+ * Component-wise safe division of two texture operands: `result = a / max(b, 0.00001)`.
+ *
+ * Each operand can be a texture, a constant factor, or a texture scaled by a factor.
+ * Division by zero is guarded with a small epsilon so the result is always finite.
+ *
+ * If both operands are constant (no textures), the operation is performed on the CPU and
+ * the result is returned as a factor-only operand with no texture allocated.
+ *
+ * When operands are results of previous operations (i.e. they carry a `dispose` function),
+ * their intermediate textures are automatically released after the GPU pass completes.
+ *
+ * @param name - Name for the resulting procedural texture (used only when a GPU pass is needed)
+ * @param a - Numerator operand
+ * @param b - Denominator operand
+ * @param scene - Scene to create the texture in (used only when a GPU pass is needed)
+ * @param outputColorSpace - Optional output color space.
+ * @param outputChannelMask - Optional bitmask of channels to write.
+ * @param outputOptions - Optional render-target type, sampling, and mipmap settings.
+ * @returns An operand whose `texture` holds the GPU result, or whose `factor` holds the CPU-folded constant
+ */
+export async function DivideTexturesAsync(
+    name: string,
+    a: ITextureProcessOperand,
+    b: ITextureProcessOperand,
+    scene: Scene,
+    outputColorSpace?: TextureColorSpace,
+    outputChannelMask?: ChannelMask,
+    outputOptions?: ITextureProcessorOutputOptions
+): Promise<ITextureProcessOperand> {
+    if (!a.texture && !b.texture) {
+        const factor = _DivideConstants(_EvalConstant(a), _EvalConstant(b));
+        return { texture: null, factor: outputChannelMask ? _ApplyOutputChannelMask(factor, outputChannelMask) : factor };
+    }
+
+    [a, b] = _KeepMatchingOperandCoordinates(name, [a, b]);
+    const allTextures: BaseTexture[] = [];
+    if (a.texture) {
+        allTextures.push(a.texture);
+    }
+    if (b.texture) {
+        allTextures.push(b.texture);
+    }
+    const canPropagate = _AllTransformsMatch(allTextures);
+    const bakeTransform = !canPropagate;
+
+    const defines = [
+        "OP_DIVIDE",
+        ..._BuildOperandDefines(a, "A", bakeTransform),
+        ..._BuildOperandDefines(b, "B", bakeTransform),
+        ...(outputChannelMask ? _BuildOutputChannelMaskDefines(outputChannelMask) : []),
+    ];
+    if (outputColorSpace) {
+        defines.push("OUTPUT_SRGB");
+    }
+    const pt = _CreateProcessorTexture(name, defines, _ResolveOutputSize([a, b]), scene, outputColorSpace, outputOptions);
+    _SetOperandUniforms(pt, a, "textureA", "factorA", bakeTransform);
+    _SetOperandUniforms(pt, b, "textureB", "factorB", bakeTransform);
+    try {
+        await _RenderAsync(pt);
+    } catch (error) {
+        a.dispose?.();
+        b.dispose?.();
+        throw error;
+    }
+
+    a.dispose?.();
+    b.dispose?.();
+
+    _CopyTextureMetadata(allTextures[0], pt, canPropagate);
+    const result: ITextureProcessOperand = { texture: pt, dispose: () => pt.dispose() };
+    if (outputColorSpace) {
+        result.colorSpace = outputColorSpace;
+    }
+    return result;
+}
+
+/**
+ * Compute the component-wise fraction `result = a / (a + b * (1 - a))` in a single GPU pass.
+ *
+ * For OpenPBR this is the transmission fraction of the dielectric's transmitted light, where `a` is
+ * the transmission weight T and `b` the subsurface weight S (subsurface covers only the remaining
+ * `1 - T`). The subsurface fraction is `1 - result`. The denominator `T + S(1 - T)` equals
+ * `1 - (1 - T)(1 - S)` but avoids subtracting values near one, and fusing the whole expression into
+ * one pass means no intermediate is quantized; only the final output is. The denominator is guarded
+ * with `max(..., 0.00001)`, so the result is 0 where both inputs are 0.
+ *
+ * If both operands are constant (no textures), the operation is performed on the CPU and
+ * the result is returned as a factor-only operand with no texture allocated.
+ *
+ * When operands are results of previous operations (i.e. they carry a `dispose` function),
+ * their intermediate textures are automatically released after the GPU pass completes.
+ *
+ * @param name - Name for the resulting procedural texture (used only when a GPU pass is needed)
+ * @param a - Transmission weight operand (T)
+ * @param b - Subsurface weight operand (S)
+ * @param scene - Scene to create the texture in (used only when a GPU pass is needed)
+ * @param outputColorSpace - Optional output color space.
+ * @param outputChannelMask - Optional bitmask of channels to write.
+ * @param outputOptions - Optional render-target type, sampling, and mipmap settings.
+ * @returns An operand whose `texture` holds the GPU result, or whose `factor` holds the CPU-folded constant
+ */
+export async function TransmissionFractionAsync(
+    name: string,
+    a: ITextureProcessOperand,
+    b: ITextureProcessOperand,
+    scene: Scene,
+    outputColorSpace?: TextureColorSpace,
+    outputChannelMask?: ChannelMask,
+    outputOptions?: ITextureProcessorOutputOptions
+): Promise<ITextureProcessOperand> {
+    if (!a.texture && !b.texture) {
+        const ca = _EvalConstant(a);
+        const cb = _EvalConstant(b);
+        const fraction = (x: number, y: number) => x / Math.max(x + y * (1 - x), 0.00001);
+        const factor = new Color4(fraction(ca.r, cb.r), fraction(ca.g, cb.g), fraction(ca.b, cb.b), fraction(ca.a, cb.a));
+        return { texture: null, factor: outputChannelMask ? _ApplyOutputChannelMask(factor, outputChannelMask) : factor };
+    }
+
+    [a, b] = _KeepMatchingOperandCoordinates(name, [a, b]);
+    const allTextures: BaseTexture[] = [];
+    if (a.texture) {
+        allTextures.push(a.texture);
+    }
+    if (b.texture) {
+        allTextures.push(b.texture);
+    }
+    const canPropagate = _AllTransformsMatch(allTextures);
+    const bakeTransform = !canPropagate;
+
+    const defines = [
+        "OP_TRANSMISSION_FRACTION",
+        ..._BuildOperandDefines(a, "A", bakeTransform),
+        ..._BuildOperandDefines(b, "B", bakeTransform),
+        ...(outputChannelMask ? _BuildOutputChannelMaskDefines(outputChannelMask) : []),
+    ];
+    if (outputColorSpace) {
+        defines.push("OUTPUT_SRGB");
+    }
+    const pt = _CreateProcessorTexture(name, defines, _ResolveOutputSize([a, b]), scene, outputColorSpace, outputOptions);
+    _SetOperandUniforms(pt, a, "textureA", "factorA", bakeTransform);
+    _SetOperandUniforms(pt, b, "textureB", "factorB", bakeTransform);
+    try {
+        await _RenderAsync(pt);
+    } catch (error) {
+        a.dispose?.();
+        b.dispose?.();
+        throw error;
+    }
+
+    a.dispose?.();
+    b.dispose?.();
+
+    _CopyTextureMetadata(allTextures[0], pt, canPropagate);
+    const result: ITextureProcessOperand = { texture: pt, dispose: () => pt.dispose() };
+    if (outputColorSpace) {
+        result.colorSpace = outputColorSpace;
+    }
+    return result;
+}
+
+/** @internal */
+function _TransmissionScatterAlbedoConstant(transmissionColor: Color4, transmissionScatter: Color4): Color4 {
+    const extinction = [transmissionColor.r, transmissionColor.g, transmissionColor.b].map((value) => -Math.log(Math.max(value, 0.0000001)));
+    const scatter = [transmissionScatter.r, transmissionScatter.g, transmissionScatter.b];
+    const shift = Math.min(0, ...extinction.map((value, i) => value - scatter[i]));
+    const albedo = scatter.map((value, i) => value / Math.max(extinction[i] - shift, 0.00001));
+    return new Color4(albedo[0], albedo[1], albedo[2], transmissionScatter.a);
+}
+
+/**
+ * Recover the single-scatter albedo of an OpenPBR 1.1 transmission volume, `scatter / extinction`, using the
+ * renderer's extinction: the absorption `-log(transmissionColor) - transmissionScatter` is shifted so its
+ * smallest channel is non-negative, and the extinction is recomputed from it. The transmission depth cancels
+ * out of the ratio, so both operands are given per unit depth. The result alpha is taken from the scatter operand.
+ *
+ * If both operands are constant (no textures), the operation is performed on the CPU and
+ * the result is returned as a factor-only operand with no texture allocated.
+ *
+ * When operands are results of previous operations (i.e. they carry a `dispose` function),
+ * their intermediate textures are automatically released after the GPU pass completes.
+ *
+ * @param name - Name for the resulting procedural texture (used only when a GPU pass is needed)
+ * @param transmissionColor - Linear transmission color operand
+ * @param transmissionScatter - Transmission scatter operand
+ * @param scene - Scene to create the texture in (used only when a GPU pass is needed)
+ * @param outputColorSpace - Optional output color space.
+ * @param outputChannelMask - Optional bitmask of channels to write.
+ * @param outputOptions - Optional render-target type, sampling, and mipmap settings.
+ * @returns An operand whose `texture` holds the GPU result, or whose `factor` holds the CPU-folded constant
+ */
+export async function TransmissionScatterToSingleScatterAlbedoAsync(
+    name: string,
+    transmissionColor: ITextureProcessOperand,
+    transmissionScatter: ITextureProcessOperand,
+    scene: Scene,
+    outputColorSpace?: TextureColorSpace,
+    outputChannelMask?: ChannelMask,
+    outputOptions?: ITextureProcessorOutputOptions
+): Promise<ITextureProcessOperand> {
+    let a = transmissionColor;
+    let b = transmissionScatter;
+    if (!a.texture && !b.texture) {
+        const factor = _TransmissionScatterAlbedoConstant(_EvalConstant(a), _EvalConstant(b));
+        return { texture: null, factor: outputChannelMask ? _ApplyOutputChannelMask(factor, outputChannelMask) : factor };
+    }
+
+    [a, b] = _KeepMatchingOperandCoordinates(name, [a, b]);
+    const allTextures: BaseTexture[] = [];
+    if (a.texture) {
+        allTextures.push(a.texture);
+    }
+    if (b.texture) {
+        allTextures.push(b.texture);
+    }
+    const canPropagate = _AllTransformsMatch(allTextures);
+    const bakeTransform = !canPropagate;
+
+    const defines = [
+        "OP_TRANSMISSION_SCATTER_ALBEDO",
+        ..._BuildOperandDefines(a, "A", bakeTransform),
+        ..._BuildOperandDefines(b, "B", bakeTransform),
+        ...(outputChannelMask ? _BuildOutputChannelMaskDefines(outputChannelMask) : []),
+    ];
+    if (outputColorSpace) {
+        defines.push("OUTPUT_SRGB");
+    }
+    const pt = _CreateProcessorTexture(name, defines, _ResolveOutputSize([a, b]), scene, outputColorSpace, outputOptions);
+    _SetOperandUniforms(pt, a, "textureA", "factorA", bakeTransform);
+    _SetOperandUniforms(pt, b, "textureB", "factorB", bakeTransform);
+    try {
+        await _RenderAsync(pt);
+    } catch (error) {
+        a.dispose?.();
+        b.dispose?.();
+        throw error;
+    }
+
+    a.dispose?.();
+    b.dispose?.();
+
+    _CopyTextureMetadata(allTextures[0], pt, canPropagate);
+    const result: ITextureProcessOperand = { texture: pt, dispose: () => pt.dispose() };
+    if (outputColorSpace) {
+        result.colorSpace = outputColorSpace;
+    }
+    return result;
+}
+
+/**
+ * Linearly interpolate between two texture operands: `result = mix(a, b, t)`.
+ *
+ * Each operand can be a texture, a constant factor, or a texture scaled by a factor.
+ * The `t` operand controls the blend weight per texel, per channel — a value of 0 returns `a`,
+ * a value of 1 returns `b`. Use a grayscale texture or a scalar `Color4(v, v, v, v)` for
+ * uniform blending across all channels.
+ *
+ * If all three operands are constant (no textures), the interpolation is performed on the CPU and
+ * the result is returned as a factor-only operand with no texture allocated.
+ *
+ * When operands are results of previous operations (i.e. they carry a `dispose` function),
+ * their intermediate textures are automatically released after the GPU pass completes.
+ *
+ * @param name - Name for the resulting procedural texture (used only when a GPU pass is needed)
+ * @param a - Start value operand (returned when t = 0)
+ * @param b - End value operand (returned when t = 1)
+ * @param t - Blend weight operand. Each channel independently controls the blend for the corresponding output channel.
+ * @param scene - Scene to create the texture in (used only when a GPU pass is needed)
+ * @param outputColorSpace - Optional output color space. When `TextureColorSpace.SRGB`, the linear
+ *   result is converted to sRGB (IEC 61966-2-1) before being written. Defaults to `TextureColorSpace.Linear`.
+ * @param outputChannelMask - Optional bitmask of channels to write. Excluded color channels are set to
+ *   `0.0`; excluded alpha is set to `1.0`. Defaults to `ChannelMask.RGBA` (all channels written).
+ * @param outputOptions - Optional render-target type, sampling, and mipmap settings.
+ * @returns An operand whose `texture` holds the GPU result, or whose `factor` holds the CPU-folded constant
+ */
+export async function LerpTexturesAsync(
+    name: string,
+    a: ITextureProcessOperand,
+    b: ITextureProcessOperand,
+    t: ITextureProcessOperand,
+    scene: Scene,
+    outputColorSpace: TextureColorSpace = TextureColorSpace.Linear,
+    outputChannelMask?: ChannelMask,
+    outputOptions?: ITextureProcessorOutputOptions
+): Promise<ITextureProcessOperand> {
+    if (!a.texture && !b.texture && !t.texture) {
+        const factor = _LerpConstants(_EvalConstant(a), _EvalConstant(b), _EvalConstant(t));
+        return { texture: null, factor: outputChannelMask ? _ApplyOutputChannelMask(factor, outputChannelMask) : factor };
+    }
+
+    [a, b, t] = _KeepMatchingOperandCoordinates(name, [a, b, t]);
+    const allTextures: BaseTexture[] = [];
+    if (a.texture) {
+        allTextures.push(a.texture);
+    }
+    if (b.texture) {
+        allTextures.push(b.texture);
+    }
+    if (t.texture) {
+        allTextures.push(t.texture);
+    }
+    const canPropagate = _AllTransformsMatch(allTextures);
+    const bakeTransform = !canPropagate;
+
+    const defines = [
+        "OP_LERP",
+        ..._BuildOperandDefines(a, "A", bakeTransform),
+        ..._BuildOperandDefines(b, "B", bakeTransform),
+        ..._BuildLerpBlendDefines(t, bakeTransform),
+        ...(outputChannelMask ? _BuildOutputChannelMaskDefines(outputChannelMask) : []),
+    ];
+    if (outputColorSpace == TextureColorSpace.SRGB) {
+        defines.push("OUTPUT_SRGB");
+    }
+    const pt = _CreateProcessorTexture(name, defines, _ResolveOutputSize([a, b, t]), scene, outputColorSpace, outputOptions);
+    _SetOperandUniforms(pt, a, "textureA", "factorA", bakeTransform);
+    _SetOperandUniforms(pt, b, "textureB", "factorB", bakeTransform);
+    _SetLerpBlendUniforms(pt, t, bakeTransform);
+    try {
+        await _RenderAsync(pt);
+    } catch (error) {
+        a.dispose?.();
+        b.dispose?.();
+        t.dispose?.();
+        throw error;
+    }
+
+    a.dispose?.();
+    b.dispose?.();
+    t.dispose?.();
+
+    _CopyTextureMetadata(allTextures[0], pt, canPropagate);
+    const result: ITextureProcessOperand = { texture: pt, dispose: () => pt.dispose() };
+    if (outputColorSpace) {
+        result.colorSpace = outputColorSpace;
+    }
+    return result;
+}
+
+/**
+ * Invert selected channels of a texture operand: `result[ch] = 1 - input[ch]`.
+ *
+ * The `channels` bitmask selects which channels are inverted; unselected channels pass through
+ * unchanged. Use `ChannelMask.RGB` for the common roughness↔smoothness conversion, or
+ * `ChannelMask.RGBA` (the default) to invert the entire texture.
+ *
+ * This is a unary operation — only operand A is used. Any `colorSpace` or `channel` properties
+ * on the input operand are honoured (sRGB linearization and channel swizzle applied before
+ * the invert).
+ *
+ * If the input is constant (no texture), the invert is performed on the CPU.
+ *
+ * When the input is the result of a previous operation (i.e. it carries a `dispose` function),
+ * its intermediate texture is automatically released after the GPU pass completes.
+ *
+ * @param name - Name for the resulting procedural texture (used only when a GPU pass is needed)
+ * @param input - Operand to invert
+ * @param scene - Scene to create the texture in (used only when a GPU pass is needed)
+ * @param channels - Bitmask of channels to invert. Defaults to `ChannelMask.RGBA`.
+ * @param outputColorSpace - Optional output color space. When `TextureColorSpace.SRGB`, the linear
+ *   result is converted to sRGB (IEC 61966-2-1) before being written. Defaults to `TextureColorSpace.Linear`.
+ * @param outputChannelMask - Optional bitmask of channels to write. Excluded color channels are set to
+ *   `0.0`; excluded alpha is set to `1.0`. Defaults to `ChannelMask.RGBA` (all channels written).
+ * @param outputOptions - Optional render-target type, sampling, and mipmap settings.
+ * @returns An operand whose `texture` holds the GPU result, or whose `factor` holds the CPU-folded constant
+ */
+export async function InvertTextureAsync(
+    name: string,
+    input: ITextureProcessOperand,
+    scene: Scene,
+    channels: ChannelMask = ChannelMask.RGBA,
+    outputColorSpace?: TextureColorSpace,
+    outputChannelMask?: ChannelMask,
+    outputOptions?: ITextureProcessorOutputOptions
+): Promise<ITextureProcessOperand> {
+    if (!input.texture) {
+        const c = _EvalConstant(input);
+        const factor = new Color4(
+            channels & ChannelMask.R ? 1 - c.r : c.r,
+            channels & ChannelMask.G ? 1 - c.g : c.g,
+            channels & ChannelMask.B ? 1 - c.b : c.b,
+            channels & ChannelMask.A ? 1 - c.a : c.a
+        );
+        return { texture: null, factor: outputChannelMask ? _ApplyOutputChannelMask(factor, outputChannelMask) : factor };
+    }
+
+    // Single input: UV transform is always propagated (no bake needed).
+    const defines = [..._BuildOperandDefines(input, "A", false), ..._BuildInvertDefines(channels), ...(outputChannelMask ? _BuildOutputChannelMaskDefines(outputChannelMask) : [])];
+    if (outputColorSpace) {
+        defines.push("OUTPUT_SRGB");
+    }
+    const pt = _CreateProcessorTexture(name, defines, _ResolveOutputSize([input]), scene, outputColorSpace, outputOptions);
+    _SetOperandUniforms(pt, input, "textureA", "factorA", false);
+    try {
+        await _RenderAsync(pt);
+    } catch (error) {
+        input.dispose?.();
+        throw error;
+    }
+
+    input.dispose?.();
+
+    _CopyTextureMetadata(input.texture, pt, true);
+    const result: ITextureProcessOperand = { texture: pt, dispose: () => pt.dispose() };
+    if (outputColorSpace) {
+        result.colorSpace = outputColorSpace;
+    }
+    return result;
+}
+
+/**
+ * Extract the per-texel maximum channel value from a texture and broadcast it to all output
+ * channels, producing a single-value (greyscale) texture in a single GPU pass.
+ *
+ * For each texel, computes `max(r, g, b)` — or `max(r, g, b, a)` when `includeAlpha` is true —
+ * and writes that scalar to the output:
+ * - `includeAlpha = false` (default): output is `(m, m, m, a)` where `m = max(r, g, b)`
+ * - `includeAlpha = true`:            output is `(m, m, m, m)` where `m = max(r, g, b, a)`
+ *
+ * This is more efficient than chaining `ExtractChannelAsync` calls through `MaxTexturesAsync`,
+ * which would require multiple intermediate textures and GPU passes.
+ *
+ * Any `colorSpace` or `channel` properties on the input operand are honoured (sRGB linearization
+ * and channel swizzle applied before the max reduction).
+ *
+ * If the input is constant (no texture), the reduction is performed on the CPU.
+ *
+ * When the input is the result of a previous operation (i.e. it carries a `dispose` function),
+ * its intermediate texture is automatically released after the GPU pass completes.
+ *
+ * @param name - Name for the resulting procedural texture (used only when a GPU pass is needed)
+ * @param input - Operand to reduce
+ * @param scene - Scene to create the texture in (used only when a GPU pass is needed)
+ * @param includeAlpha - When true, alpha participates in the max and is also set to the result.
+ *   Defaults to false (alpha is preserved from the input).
+ * @param outputColorSpace - Optional output color space. When `TextureColorSpace.SRGB`, the linear
+ *   result is converted to sRGB (IEC 61966-2-1) before being written. Defaults to `TextureColorSpace.Linear`.
+ * @param outputChannelMask - Optional bitmask of channels to write. Excluded color channels are set to
+ *   `0.0`; excluded alpha is set to `1.0`. Defaults to `ChannelMask.RGBA` (all channels written).
+ * @param outputOptions - Optional render-target type, sampling, and mipmap settings.
+ * @returns An operand whose `texture` holds the GPU result, or whose `factor` holds the CPU-folded constant
+ */
+export async function ExtractMaxChannelAsync(
+    name: string,
+    input: ITextureProcessOperand,
+    scene: Scene,
+    includeAlpha: boolean = false,
+    outputColorSpace?: TextureColorSpace,
+    outputChannelMask?: ChannelMask,
+    outputOptions?: ITextureProcessorOutputOptions
+): Promise<ITextureProcessOperand> {
+    if (!input.texture) {
+        const c = _EvalConstant(input);
+        const m = includeAlpha ? Math.max(c.r, c.g, c.b, c.a) : Math.max(c.r, c.g, c.b);
+        const factor = new Color4(m, m, m, includeAlpha ? m : c.a);
+        return { texture: null, factor: outputChannelMask ? _ApplyOutputChannelMask(factor, outputChannelMask) : factor };
+    }
+
+    // Single input: UV transform is always propagated (no bake needed).
+    const defines = [..._BuildOperandDefines(input, "A", false), "OP_CHANNEL_MAX", ...(outputChannelMask ? _BuildOutputChannelMaskDefines(outputChannelMask) : [])];
+    if (includeAlpha) {
+        defines.push("CHANNEL_MAX_INCLUDE_ALPHA");
+    }
+    if (outputColorSpace) {
+        defines.push("OUTPUT_SRGB");
+    }
+    const pt = _CreateProcessorTexture(name, defines, _ResolveOutputSize([input]), scene, outputColorSpace, outputOptions);
+    _SetOperandUniforms(pt, input, "textureA", "factorA", false);
+    try {
+        await _RenderAsync(pt);
+    } catch (error) {
+        input.dispose?.();
+        throw error;
+    }
+
+    input.dispose?.();
+
+    _CopyTextureMetadata(input.texture, pt, true);
+    const result: ITextureProcessOperand = { texture: pt, dispose: () => pt.dispose() };
+    if (outputColorSpace) {
+        result.colorSpace = outputColorSpace;
+    }
+    return result;
+}
+
+/**
+ * Extract a single channel from a texture and broadcast it to RGB (or all four components for
+ * `TextureChannel.A`), producing a new texture. This is a convenience wrapper over
+ * `MultiplyTexturesAsync` with a `(1,1,1,1)` factor and the requested channel swizzle applied
+ * to the input.
+ *
+ * Swizzle results per channel:
+ * - `TextureChannel.R` → (r, r, r, a)
+ * - `TextureChannel.G` → (g, g, g, a)
+ * - `TextureChannel.B` → (b, b, b, a)
+ * - `TextureChannel.A` → (a, a, a, a)
+ *
+ * If the input is constant (no texture), the swizzle is applied on the CPU.
+ *
+ * Any `colorSpace` property on the input operand is honoured (sRGB linearization applied before
+ * the swizzle). Any existing `channel` on the input is replaced by the `channel` argument.
+ *
+ * When the input is the result of a previous operation (i.e. it carries a `dispose` function),
+ * its intermediate texture is automatically released after the GPU pass completes.
+ *
+ * @param name - Name for the resulting procedural texture (used only when a GPU pass is needed)
+ * @param input - Operand to extract the channel from
+ * @param channel - The channel to extract and broadcast
+ * @param scene - Scene to create the texture in (used only when a GPU pass is needed)
+ * @param outputColorSpace - Optional output color space. When `TextureColorSpace.SRGB`, the linear
+ *   result is converted to sRGB (IEC 61966-2-1) before being written. Defaults to `TextureColorSpace.Linear`.
+ * @param outputChannelMask - Optional bitmask of channels to write. Excluded color channels are set to
+ *   `0.0`; excluded alpha is set to `1.0`. Defaults to `ChannelMask.RGBA` (all channels written).
+ * @param outputOptions - Optional render-target type, sampling, and mipmap settings.
+ * @returns An operand whose `texture` holds the GPU result, or whose `factor` holds the CPU-folded constant
+ */
+export async function ExtractChannelAsync(
+    name: string,
+    input: ITextureProcessOperand,
+    channel: TextureChannel,
+    scene: Scene,
+    outputColorSpace?: TextureColorSpace,
+    outputChannelMask?: ChannelMask,
+    outputOptions?: ITextureProcessorOutputOptions
+): Promise<ITextureProcessOperand> {
+    if (!input.texture) {
+        const swizzled = _ApplyChannelSwizzle(_EvalConstant(input), channel);
+        return { texture: null, factor: outputChannelMask ? _ApplyOutputChannelMask(swizzled, outputChannelMask) : swizzled };
+    }
+    return await MultiplyTexturesAsync(name, { ...input, channel }, CreateFactorOperand(new Color4(1, 1, 1, 1)), scene, outputColorSpace, outputChannelMask, outputOptions);
+}
+
+/**
+ * Convert a multi-scatter albedo operand to single-scatter albedo using the OpenPBR/KHR
+ * approximation. RGB is clamped to `[0, 1]` before conversion and alpha is preserved.
+ *
+ * If the operand is constant, the conversion is performed on the CPU. Otherwise it is baked
+ * into a linear procedural texture. Input color-space conversion, channel selection, factors,
+ * UV transforms, metadata propagation, and intermediate disposal follow the other unary texture
+ * processor operations.
+ *
+ * @param name - Name for the resulting procedural texture (used only when a GPU pass is needed)
+ * @param input - Multi-scatter albedo operand to convert
+ * @param scene - Scene to create the texture in (used only when a GPU pass is needed)
+ * @param aniso - Scattering anisotropy in `[-1, 1]`. `0` (default) is isotropic; positive values are
+ *   forward-scattering. Matches `multiScatterToSingleScatterAlbedo(rho_ms, aniso)` in helperFunctions.
+ *   Clamped to `[-0.9999, 0.9999]`, as in the renderer.
+ * @param scale - Optional operand multiplied into `input` (RGBA) before conversion, in the same pass. Use it
+ *   instead of a separate {@link MultiplyTexturesAsync} so that the product (e.g. scatter strength times
+ *   multi-scatter color) isn't quantized before the nonlinear conversion.
+ * @returns An operand containing the converted single-scatter albedo
+ */
+export async function MultiScatterToSingleScatterAlbedoAsync(
+    name: string,
+    input: ITextureProcessOperand,
+    scene: Scene,
+    aniso: number = 0,
+    scale?: ITextureProcessOperand
+): Promise<ITextureProcessOperand> {
+    aniso = _EffectiveScatterAnisotropy(aniso);
+    if (!input.texture && !scale?.texture) {
+        const multiScatter = scale ? _MultiplyConstants(_EvalConstant(input), _EvalConstant(scale)) : _EvalConstant(input);
+        return { texture: null, factor: _MultiScatterToSingleScatterAlbedoConstant(multiScatter, aniso) };
+    }
+
+    const operands = scale ? _KeepMatchingOperandCoordinates(name, [input, scale]) : [input];
+    const allTextures = operands.map((operand) => operand.texture).filter((texture): texture is BaseTexture => !!texture);
+    const canPropagate = _AllTransformsMatch(allTextures);
+    const bakeTransform = !canPropagate;
+
+    const defines = [..._BuildOperandDefines(operands[0], "A", bakeTransform), "OP_MULTI_SCATTER_TO_SINGLE_SCATTER"];
+    if (operands[1]) {
+        defines.push(..._BuildOperandDefines(operands[1], "B", bakeTransform), "MULTI_SCATTER_SCALE_B");
+    }
+    const pt = _CreateProcessorTexture(name, defines, _ResolveOutputSize(operands), scene);
+    _SetOperandUniforms(pt, operands[0], "textureA", "factorA", bakeTransform);
+    if (operands[1]) {
+        _SetOperandUniforms(pt, operands[1], "textureB", "factorB", bakeTransform);
+    }
+    pt.setFloat("scatterAniso", aniso);
+    const disposeOperands = () => operands.forEach((operand) => operand.dispose?.());
+    try {
+        await _RenderAsync(pt);
+    } catch (error) {
+        disposeOperands();
+        throw error;
+    }
+
+    disposeOperands();
+
+    _CopyTextureMetadata(allTextures[0], pt, canPropagate);
+    return { texture: pt, dispose: () => pt.dispose() };
+}
+
+/**
+ * Convert a single-scatter albedo operand to multi-scatter albedo using the OpenPBR/KHR
+ * approximation. This is the inverse of {@link MultiScatterToSingleScatterAlbedoAsync}.
+ * RGB is clamped to `[0, 1]` before conversion and alpha is preserved.
+ *
+ * If the operand is constant, the conversion is performed on the CPU. Otherwise it is baked
+ * into a linear procedural texture. Input color-space conversion, channel selection, factors,
+ * UV transforms, metadata propagation, and intermediate disposal follow the other unary texture
+ * processor operations.
+ *
+ * @param name - Name for the resulting procedural texture (used only when a GPU pass is needed)
+ * @param input - Single-scatter albedo operand to convert
+ * @param scene - Scene to create the texture in (used only when a GPU pass is needed)
+ * @param aniso - Scattering anisotropy in `[-1, 1]`. `0` (default) is isotropic; positive values are
+ *   forward-scattering. This inverts the anisotropic multi→single mapping: `s^2 = (1 - rho_ss) /
+ *   (1 - aniso * rho_ss)`, then `rho_ms = (1 - s)(1 - 0.139 s)/(1 + 1.17 s)`. Clamped to
+ *   `[-0.9999, 0.9999]`, as in the renderer.
+ * @param outputOptions - Optional render-target type, sampling, and mipmap settings.
+ * @returns An operand containing the converted multi-scatter albedo
+ */
+export async function SingleScatterToMultiScatterAlbedoAsync(
+    name: string,
+    input: ITextureProcessOperand,
+    scene: Scene,
+    aniso: number = 0,
+    outputOptions?: ITextureProcessorOutputOptions
+): Promise<ITextureProcessOperand> {
+    aniso = _EffectiveScatterAnisotropy(aniso);
+    if (!input.texture) {
+        return { texture: null, factor: _SingleScatterToMultiScatterAlbedoConstant(_EvalConstant(input), aniso) };
+    }
+
+    const defines = [..._BuildOperandDefines(input, "A", false), "OP_SINGLE_SCATTER_TO_MULTI_SCATTER"];
+    const pt = _CreateProcessorTexture(name, defines, _ResolveOutputSize([input]), scene, undefined, outputOptions);
+    _SetOperandUniforms(pt, input, "textureA", "factorA", false);
+    pt.setFloat("scatterAniso", aniso);
+    try {
+        await _RenderAsync(pt);
+    } catch (error) {
+        input.dispose?.();
+        throw error;
+    }
+
+    input.dispose?.();
+
+    _CopyTextureMetadata(input.texture, pt, true);
+    return { texture: pt, dispose: () => pt.dispose() };
+}
+
+/**
+ * Compute the OpenPBR thin-walled scatter weights from a transmission operand (T) and a
+ * scatter-strength operand (S).  Both operands are read from their R channel (after the operand's
+ * channel swizzle and factor), and each weight is broadcast to all four output channels.
+ *
+ * For each texel:
+ * ```
+ *   transmission_weight = T * (1 - S)
+ *   subsurface_weight   = T * S / (1 - T*(1-S))
+ * ```
+ *
+ * These are the OpenPBR weight values when a thin-walled glTF material combines
+ * KHR_materials_transmission (T = transmissionFactor * transmissionTexture) and
+ * KHR_materials_scatter (S = scatterStrengthFactor * scatterStrengthTexture):
+ * `scatterStrengthFactor` converts a fraction of the coherent transmission budget into
+ * scattered (subsurface) transmission while keeping the total translucency constant.
+ *
+ * When both operands are constants the computation is performed entirely on the CPU.
+ * When either operand has a texture, each weight is computed from T and S in a single GPU pass, so
+ * only the two outputs are quantized. Near T = 1 the subsurface weight divides two small values, and
+ * quantizing intermediates (e.g. T * S or 1 - S to 8 bits) would change it drastically.
+ *
+ * @param name - Base name for any procedural textures created
+ * @param transmission - T operand (transmissionFactor × optional transmissionTexture, R channel)
+ * @param scatter - S operand (scatterStrengthFactor × optional scatterStrengthTexture, R channel)
+ * @param scene - Scene used for GPU passes when textures are involved
+ * @returns `{ transmission, subsurface }` – two operands ready to assign to
+ *   `transmissionWeightTexture` / `subsurfaceWeightTexture` (and the corresponding scalar factors)
+ */
+export async function ThinWalledScatterWeightsAsync(
+    name: string,
+    transmission: ITextureProcessOperand,
+    scatter: ITextureProcessOperand,
+    scene: Scene
+): Promise<{ transmission: ITextureProcessOperand; subsurface: ITextureProcessOperand }> {
+    [transmission, scatter] = _KeepMatchingOperandCoordinates(name, [transmission, scatter]);
+    // Constant-only fast path — compute entirely on the CPU.
+    if (!transmission.texture && !scatter.texture) {
+        const transmissionFactor = _EvalConstant(transmission).r;
+        const scatterStrength = _EvalConstant(scatter).r;
+        const transW = transmissionFactor * (1.0 - scatterStrength);
+        const transmittedScatter = transmissionFactor * scatterStrength;
+        // 1 - T(1 - S), written to avoid cancellation near T = 1.
+        const denom = 1.0 - transmissionFactor + transmittedScatter;
+        const ssW = denom > 0.00001 ? transmittedScatter / denom : 0.0;
+        transmission.dispose?.();
+        scatter.dispose?.();
+        return {
+            transmission: { texture: null, factor: new Color4(transW, transW, transW, transW) },
+            subsurface: { texture: null, factor: new Color4(ssW, ssW, ssW, ssW) },
+        };
+    }
+
+    // GPU path. Each weight is computed from T and S in one pass, so there are no intermediate textures to
+    // quantize. T and S are consumed by both passes and released only after both have run.
+    try {
+        const transW = await _RenderThinWalledWeightAsync(`${name}_transWeight`, "OP_THIN_WALLED_TRANSMISSION_WEIGHT", transmission, scatter, scene);
+        try {
+            const ssW = await _RenderThinWalledWeightAsync(`${name}_subWeight`, "OP_THIN_WALLED_SUBSURFACE_WEIGHT", transmission, scatter, scene);
+            return { transmission: transW, subsurface: ssW };
+        } catch (error) {
+            transW.dispose?.();
+            throw error;
+        }
+    } finally {
+        transmission.dispose?.();
+        scatter.dispose?.();
+    }
+}
+
+/**
+ * Renders one thin-walled scatter weight from the transmission and scatter strength operands. The operands
+ * are not disposed, since both weights are computed from them.
+ * @param name - Name for the resulting procedural texture
+ * @param op - Shader operation define
+ * @param transmission - T operand
+ * @param scatter - S operand
+ * @param scene - Scene to create the texture in
+ * @returns An operand whose `texture` holds the weight
+ */
+async function _RenderThinWalledWeightAsync(
+    name: string,
+    op: "OP_THIN_WALLED_TRANSMISSION_WEIGHT" | "OP_THIN_WALLED_SUBSURFACE_WEIGHT",
+    transmission: ITextureProcessOperand,
+    scatter: ITextureProcessOperand,
+    scene: Scene
+): Promise<ITextureProcessOperand> {
+    const allTextures: BaseTexture[] = [];
+    if (transmission.texture) {
+        allTextures.push(transmission.texture);
+    }
+    if (scatter.texture) {
+        allTextures.push(scatter.texture);
+    }
+    const canPropagate = _AllTransformsMatch(allTextures);
+    const bakeTransform = !canPropagate;
+
+    const defines = [op, ..._BuildOperandDefines(transmission, "A", bakeTransform), ..._BuildOperandDefines(scatter, "B", bakeTransform)];
+    const pt = _CreateProcessorTexture(name, defines, _ResolveOutputSize([transmission, scatter]), scene);
+    _SetOperandUniforms(pt, transmission, "textureA", "factorA", bakeTransform);
+    _SetOperandUniforms(pt, scatter, "textureB", "factorB", bakeTransform);
+    try {
+        await _RenderAsync(pt);
+    } catch (error) {
+        pt.dispose();
+        throw error;
+    }
+
+    _CopyTextureMetadata(allTextures[0], pt, canPropagate);
+    return { texture: pt, dispose: () => pt.dispose() };
+}

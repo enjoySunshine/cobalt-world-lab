@@ -1,0 +1,9 @@
+export * from "./engine.transformFeedback.types";
+/**
+ * Re-exports pure implementation and applies runtime side effects.
+ * Import engine.transformFeedback.pure for tree-shakeable, side-effect-free usage.
+ */
+export * from "./engine.transformFeedback.pure";
+
+import { RegisterEngineTransformFeedback } from "./engine.transformFeedback.pure";
+RegisterEngineTransformFeedback();

@@ -1,0 +1,68 @@
+/* eslint-disable @typescript-eslint/no-restricted-imports */
+export * from "./baseTexture";
+
+export * from "./baseTexture.polynomial";
+export * from "./colorGradingTexture";
+export * from "./cubeTexture";
+export * from "./dynamicTexture";
+export * from "./equiRectangularCubeTexture";
+export * from "./externalTexture";
+export * from "./Filtering/hdrFiltering";
+export * from "./envCubeTexture";
+export * from "./hdrCubeTexture";
+export * from "./exrCubeTexture";
+export * from "./htmlElementTexture";
+export * from "./HTML/index";
+export * from "./internalTexture";
+export * from "./Loaders/index";
+export * from "./mirrorTexture";
+export * from "./multiRenderTarget";
+export * from "./Packer/index";
+export * from "./Procedurals/index";
+export * from "./rawCubeTexture";
+export * from "./rawTexture";
+export * from "./rawTexture2DArray";
+export * from "./rawTexture2DArray.functions";
+export * from "./rawTexture3D";
+export * from "./refractionTexture";
+export * from "./renderTargetTexture";
+export * from "./textureMerger";
+export * from "./textureSampler";
+export * from "./textureProcessor";
+export * from "./texture";
+export * from "./thinTexture";
+export * from "./thinRenderTargetTexture";
+export * from "./videoTexture";
+export * from "./ktx2decoderTypes";
+export * from "./textureCreationOptions";
+
+// Shaders for procedural textures
+export * from "../../ShadersWGSL/procedural.vertex";
+export * from "../../Shaders/procedural.vertex";
+
+// HDR filtering
+export * from "../../Shaders/hdrFiltering.vertex";
+export * from "../../Shaders/hdrFiltering.fragment";
+export * from "../../ShadersWGSL/hdrFiltering.vertex";
+export * from "../../ShadersWGSL/hdrFiltering.fragment";
+export * from "../../Shaders/hdrIrradianceFiltering.vertex";
+export * from "../../Shaders/hdrIrradianceFiltering.fragment";
+export * from "../../ShadersWGSL/hdrIrradianceFiltering.vertex";
+export * from "../../ShadersWGSL/hdrIrradianceFiltering.fragment";
+
+// HDR filtering shader includes (needed by external packages)
+export * from "../../ShadersWGSL/ShadersInclude/importanceSampling";
+export * from "../../ShadersWGSL/ShadersInclude/pbrBRDFFunctions";
+export * from "../../ShadersWGSL/ShadersInclude/hdrFilteringFunctions";
+export * from "../../Shaders/ShadersInclude/importanceSampling";
+export * from "../../Shaders/ShadersInclude/pbrBRDFFunctions";
+export * from "../../Shaders/ShadersInclude/hdrFilteringFunctions";
+
+// Intersection & LTC helper functions (needed by external packages)
+export * from "../../ShadersWGSL/ShadersInclude/clusteredLightingFunctions";
+export * from "../../ShadersWGSL/ShadersInclude/clusteredLightingCompute";
+export * from "../../ShadersWGSL/ShadersInclude/intersectionFunctions";
+export * from "../../ShadersWGSL/ShadersInclude/ltcHelperFunctions";
+export * from "../../Shaders/ShadersInclude/clusteredLightingFunctions";
+export * from "../../Shaders/ShadersInclude/intersectionFunctions";
+export * from "../../Shaders/ShadersInclude/ltcHelperFunctions";

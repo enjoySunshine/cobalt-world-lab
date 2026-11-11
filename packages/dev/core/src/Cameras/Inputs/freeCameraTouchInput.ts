@@ -1,0 +1,238 @@
+import { serialize } from "../../Misc/decorators";
+import { type Observer, type EventState } from "../../Misc/observable";
+import { type Nullable } from "../../types";
+import { type ICameraInput, CameraInputTypes } from "../../Cameras/cameraInputsManager";
+import { type FreeCamera } from "../../Cameras/freeCamera";
+import { type PointerInfo, PointerEventTypes } from "../../Events/pointerEvents";
+import { Matrix, TmpVectors, Vector3 } from "../../Maths/math.vector.pure";
+import { Tools } from "../../Misc/tools.pure";
+import { type IPointerEvent } from "../../Events/deviceInputEvents";
+/**
+ * Manage the touch inputs to control the movement of a free camera.
+ * @see https://doc.babylonjs.com/features/featuresDeepDive/cameras/customizingCameraInputs
+ */
+export class FreeCameraTouchInput implements ICameraInput<FreeCamera> {
+    /**
+     * Defines the camera the input is attached to.
+     */
+    public camera: FreeCamera;
+
+    /**
+     * Defines the touch sensibility for rotation.
+     * The lower the faster.
+     */
+    @serialize()
+    public touchAngularSensibility: number = 200000.0;
+
+    /**
+     * Defines the touch sensibility for move.
+     * The lower the faster.
+     */
+    @serialize()
+    public touchMoveSensibility: number = 250.0;
+
+    /**
+     * Swap touch actions so that one touch is used for rotation and multiple for movement
+     */
+    public singleFingerRotate: boolean = false;
+
+    private _offsetX: Nullable<number> = null;
+    private _offsetY: Nullable<number> = null;
+
+    private _pointerPressed = new Array<number>();
+    private _pointerInput?: (p: PointerInfo, s: EventState) => void;
+    private _observer: Nullable<Observer<PointerInfo>>;
+    private _onLostFocus: Nullable<(e: FocusEvent) => any>;
+    private _isSafari: boolean;
+
+    /**
+     * Manage the touch inputs to control the movement of a free camera.
+     * @see https://doc.babylonjs.com/features/featuresDeepDive/cameras/customizingCameraInputs
+     * @param allowMouse Defines if mouse events can be treated as touch events
+     */
+    constructor(
+        /**
+         * [false] Define if mouse events can be treated as touch events
+         */
+        public allowMouse = false
+    ) {
+        this._isSafari = Tools.IsSafari();
+    }
+
+    /**
+     * Attach the input controls to a specific dom element to get the input from.
+     * @param noPreventDefault Defines whether event caught by the controls should call preventdefault() (https://developer.mozilla.org/en-US/docs/Web/API/Event/preventDefault)
+     */
+    public attachControl(noPreventDefault?: boolean): void {
+        noPreventDefault = Tools.BackCompatCameraNoPreventDefault(arguments);
+        let previousPosition: Nullable<{ x: number; y: number }> = null;
+
+        if (this._pointerInput === undefined) {
+            this._onLostFocus = () => {
+                this._offsetX = null;
+                this._offsetY = null;
+            };
+
+            this._pointerInput = (p) => {
+                const evt = <IPointerEvent>p.event;
+
+                const isMouseEvent = evt.pointerType === "mouse" || (this._isSafari && typeof evt.pointerType === "undefined");
+
+                if (!this.allowMouse && isMouseEvent) {
+                    return;
+                }
+
+                if (p.type === PointerEventTypes.POINTERDOWN) {
+                    if (!noPreventDefault) {
+                        evt.preventDefault();
+                    }
+
+                    this._pointerPressed.push(evt.pointerId);
+
+                    if (this._pointerPressed.length !== 1) {
+                        return;
+                    }
+
+                    previousPosition = {
+                        x: evt.clientX,
+                        y: evt.clientY,
+                    };
+                } else if (p.type === PointerEventTypes.POINTERUP) {
+                    if (!noPreventDefault) {
+                        evt.preventDefault();
+                    }
+
+                    const index: number = this._pointerPressed.indexOf(evt.pointerId);
+
+                    if (index === -1) {
+                        return;
+                    }
+                    this._pointerPressed.splice(index, 1);
+
+                    if (index != 0) {
+                        return;
+                    }
+                    previousPosition = null;
+                    this._offsetX = null;
+                    this._offsetY = null;
+                } else if (p.type === PointerEventTypes.POINTERMOVE) {
+                    if (!noPreventDefault) {
+                        evt.preventDefault();
+                    }
+
+                    if (!previousPosition) {
+                        return;
+                    }
+
+                    const index: number = this._pointerPressed.indexOf(evt.pointerId);
+
+                    if (index != 0) {
+                        return;
+                    }
+
+                    this._offsetX = evt.clientX - previousPosition.x;
+                    this._offsetY = -(evt.clientY - previousPosition.y);
+                }
+            };
+        }
+
+        this._observer = this.camera
+            .getScene()
+            ._inputManager._addCameraPointerObserver(this._pointerInput, PointerEventTypes.POINTERDOWN | PointerEventTypes.POINTERUP | PointerEventTypes.POINTERMOVE);
+
+        if (this._onLostFocus) {
+            const engine = this.camera.getEngine();
+            const element = engine.getInputElement();
+            if (element) {
+                element.addEventListener("blur", this._onLostFocus);
+            }
+        }
+    }
+
+    /**
+     * Detach the current controls from the specified dom element.
+     */
+    public detachControl(): void {
+        if (this._pointerInput) {
+            if (this._observer) {
+                this.camera.getScene()._inputManager._removeCameraPointerObserver(this._observer);
+                this._observer = null;
+            }
+
+            if (this._onLostFocus) {
+                const engine = this.camera.getEngine();
+                const element = engine.getInputElement();
+                if (element) {
+                    element.removeEventListener("blur", this._onLostFocus);
+                }
+
+                this._onLostFocus = null;
+            }
+            this._pointerPressed.length = 0;
+            this._offsetX = null;
+            this._offsetY = null;
+        }
+    }
+
+    /**
+     * Update the current camera state depending on the inputs that have been used this frame.
+     * This is a dynamically created lambda to avoid the performance penalty of looping for inputs in the render loop.
+     */
+    public checkInputs(): void {
+        if (this._offsetX === null || this._offsetY === null) {
+            return;
+        }
+        if (this._offsetX === 0 && this._offsetY === 0) {
+            return;
+        }
+
+        const camera = this.camera;
+        // Touch look (yaw/pitch) is gated on touch→rotate and the forward drag-move on
+        // touch→translate. Removing an entry disables that touch behavior. An entry's optional
+        // `sensitivity` replaces the legacy 1/touchAngularSensibility (rotate) or
+        // 1/touchMoveSensibility (translate) scale factor.
+        const input = camera.movement.input;
+        const rotateEntry = input.getEntry("touch", "rotate");
+        const translateEntry = input.getEntry("touch", "translate");
+        const handednessMultiplier = camera._calculateHandednessMultiplier();
+
+        const rotateCamera = (this.singleFingerRotate && this._pointerPressed.length === 1) || (!this.singleFingerRotate && this._pointerPressed.length > 1);
+
+        if (rotateEntry) {
+            const rotateSensitivity = rotateEntry.sensitivity ?? 1 / this.touchAngularSensibility;
+            camera.cameraRotation.y = this._offsetX * handednessMultiplier * rotateSensitivity;
+            if (rotateCamera) {
+                camera.cameraRotation.x = -(this._offsetY * handednessMultiplier) * rotateSensitivity;
+            }
+        }
+
+        if (!rotateCamera && translateEntry) {
+            const speed = camera._computeLocalCameraSpeed();
+            const moveSensitivity = translateEntry.sensitivity ?? (this.touchMoveSensibility !== 0 ? 1 / this.touchMoveSensibility : 0);
+            const direction = TmpVectors.Vector3[0];
+            direction.copyFromFloats(0, 0, speed * this._offsetY * moveSensitivity);
+
+            Matrix.RotationYawPitchRollToRef(camera.rotation.y, camera.rotation.x, 0, camera._cameraRotationMatrix);
+            Vector3.TransformCoordinatesToRef(direction, camera._cameraRotationMatrix, direction);
+            camera.cameraDirection.addInPlace(direction);
+        }
+    }
+
+    /**
+     * Gets the class name of the current input.
+     * @returns the class name
+     */
+    public getClassName(): string {
+        return "FreeCameraTouchInput";
+    }
+
+    /**
+     * Get the friendly name associated with the input class.
+     * @returns the input friendly name
+     */
+    public getSimpleName(): string {
+        return "touch";
+    }
+}
+
+(<any>CameraInputTypes)["FreeCameraTouchInput"] = FreeCameraTouchInput;

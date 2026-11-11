@@ -1,0 +1,46 @@
+{
+  "name": "babylonjs-inspector-legacy",
+  "version": "9.35.0",
+  "private": true,
+  "main": "babylon.inspector.bundle.js",
+  "types": "babylon.inspector.module.d.ts",
+  "files": [
+    "*"
+  ],
+  "scripts": {
+    "build": "npm run clean && npm run build:prod && npm run build:declaration",
+    "build:dev": "rollup -c rollup.config.umd.mjs",
+    "build:dev:fast": "rollup -c rollup.config.umd.mjs --environment ROLLUP_DEVMODE:true",
+    "build:prod": "rollup -c rollup.config.umd.mjs --environment ROLLUP_MODE:production",
+    "build:declaration": "build-tools -c pud --config ./config.json",
+    "clean": "rimraf dist && rimraf babylon*.* -g"
+  },
+  "dependencies": {
+    "babylonjs": "9.35.0",
+    "babylonjs-addons": "9.35.0",
+    "babylonjs-gui": "9.35.0",
+    "babylonjs-gui-editor": "9.35.0",
+    "babylonjs-loaders": "9.35.0",
+    "babylonjs-materials": "9.35.0",
+    "babylonjs-serializers": "9.35.0"
+  },
+  "devDependencies": {
+    "@dev/addons": "1.0.0",
+    "@dev/build-tools": "1.0.0",
+    "@dev/inspector-legacy": "1.0.0",
+    "@dev/shared-ui-components": "1.0.0",
+    "@types/react": "^18.3.31",
+    "@types/react-dom": "^18.3.7",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "keywords": [
+    "3D",
+    "javascript",
+    "html5",
+    "webgl",
+    "babylon.js"
+  ],
+  "license": "Apache-2.0",
+  "sideEffects": true
+}

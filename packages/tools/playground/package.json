@@ -1,0 +1,33 @@
+{
+    "name": "@tools/playground",
+    "private": true,
+    "version": "1.0.0",
+    "scripts": {
+        "build": "vite build",
+        "build:declaration": "build-tools -c pud --config ./config.json",
+        "build:deployment": "npm run clean && vite build",
+        "typecheck": "tsc -p tsconfig.build.json --noEmit",
+        "serve": "vite",
+        "serve:prod": "vite build && vite preview",
+        "serve:https": "vite --host :: --https",
+        "serve:dev": "vite",
+        "clean": "rimraf dist"
+    },
+    "devDependencies": {
+        "@dev/build-tools": "1.0.0",
+        "@dev/core": "1.0.0",
+        "@svgr/plugin-jsx": "^8.1.0",
+        "@svgr/plugin-svgo": "^8.1.0",
+        "@tools/snippet-loader": "1.0.0",
+        "@types/react": "^18.3.31",
+        "@types/react-dom": "^18.3.7",
+        "@typescript/ata": "^0.9.8",
+        "es-module-lexer": "^1.7.0",
+        "monaco-editor": "^0.57.0",
+        "react": "^18.3.1",
+        "react-dom": "^18.3.1",
+        "uuid": "^14.0.3",
+        "vite-plugin-svgr": "^5.2.0"
+    },
+    "sideEffects": true
+}

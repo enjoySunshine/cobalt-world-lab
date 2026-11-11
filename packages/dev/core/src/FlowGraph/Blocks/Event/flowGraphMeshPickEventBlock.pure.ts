@@ -1,0 +1,161 @@
+/** This file must only contain pure code and pure imports */
+
+import { type AbstractMesh } from "../../../Meshes/abstractMesh.pure";
+import { FlowGraphEventBlock } from "../../flowGraphEventBlock";
+import { type PointerInfo, PointerEventTypes } from "../../../Events/pointerEvents";
+import { type IPointerEvent } from "../../../Events/deviceInputEvents";
+import { type FlowGraphContext } from "../../flowGraphContext";
+import { type IFlowGraphBlockConfiguration } from "../../flowGraphBlock";
+import { _IsDescendantOf } from "../../utils";
+import { FlowGraphBlockNames } from "../flowGraphBlockNames";
+import { type FlowGraphDataConnection } from "core/FlowGraph/flowGraphDataConnection.pure";
+import { RichTypeAny, RichTypeNumber, RichTypeVector3 } from "core/FlowGraph/flowGraphRichTypes.pure";
+import { Vector3 } from "core/Maths/math.vector.pure";
+import { FlowGraphEventType } from "core/FlowGraph/flowGraphEventType";
+import { RegisterClass } from "../../../Misc/typeStore";
+/**
+ * Configuration for the mesh pick event block.
+ */
+export interface IFlowGraphMeshPickEventBlockConfiguration extends IFlowGraphBlockConfiguration {
+    /**
+     * Should this mesh block propagation of the event.
+     */
+    stopPropagation?: boolean;
+
+    /**
+     * The mesh to listen to. Can also be set by the asset input.
+     */
+    targetMesh?: AbstractMesh;
+    /**
+     * Whether unavailable selection vectors use NaN components.
+     */
+    useNaNDefaults?: boolean;
+    /**
+     * Initial pointer/controller id.
+     */
+    pointerIdDefault?: number;
+}
+/**
+ * A block that activates when a mesh is picked.
+ */
+export class FlowGraphMeshPickEventBlock extends FlowGraphEventBlock {
+    /**
+     * Input connection: The mesh to listen to.
+     */
+    public readonly asset: FlowGraphDataConnection<AbstractMesh>;
+
+    /**
+     * Output connection: The picked point.
+     */
+    public readonly pickedPoint: FlowGraphDataConnection<Vector3>;
+
+    /**
+     * Output connection: The picked origin.
+     */
+    public readonly pickOrigin: FlowGraphDataConnection<Vector3>;
+
+    /**
+     * Output connection: The pointer id.
+     */
+    public readonly pointerId: FlowGraphDataConnection<number>;
+
+    /**
+     * Output connection: The picked mesh. Possibly NOT the same as the asset (could be a descendant).
+     */
+    public readonly pickedMesh: FlowGraphDataConnection<AbstractMesh>;
+
+    /**
+     * Input connection: The type of the pointer event.
+     */
+    public readonly pointerType: FlowGraphDataConnection<PointerEventTypes>;
+
+    /**
+     * the type of the event this block reacts to
+     */
+    public override readonly type: FlowGraphEventType = FlowGraphEventType.MeshPick;
+
+    public constructor(
+        /**
+         * the configuration of the block
+         */
+        public override config?: IFlowGraphMeshPickEventBlockConfiguration
+    ) {
+        super(config);
+        const vectorDefault = config?.useNaNDefaults ? new Vector3(NaN, NaN, NaN) : undefined;
+        this.asset = this.registerDataInput("asset", RichTypeAny, config?.targetMesh);
+        this.pickedPoint = this.registerDataOutput("pickedPoint", RichTypeVector3, vectorDefault);
+        this.pickOrigin = this.registerDataOutput("pickOrigin", RichTypeVector3, vectorDefault);
+        this.pointerId = this.registerDataOutput("pointerId", RichTypeNumber, config?.pointerIdDefault);
+        this.pickedMesh = this.registerDataOutput("pickedMesh", RichTypeAny);
+        this.pointerType = this.registerDataInput("pointerType", RichTypeAny, PointerEventTypes.POINTERPICK);
+    }
+
+    public _getReferencedMesh(context: FlowGraphContext): AbstractMesh {
+        return this.asset.getValue(context);
+    }
+
+    public override _executeEvent(context: FlowGraphContext, pickedInfo: PointerInfo): boolean {
+        // get the pointer type
+        const pointerType = this.pointerType.getValue(context);
+        if (pointerType !== pickedInfo.type) {
+            // returning true here to continue the propagation of the pointer event to the rest of the blocks
+            return true;
+        }
+        const mesh = this._getReferencedMesh(context);
+        const pickedMesh = pickedInfo.pickInfo?.pickedMesh;
+        // When no target mesh is configured, fire for any picked mesh.
+        // When a target is configured, require an exact match or descendant match.
+        const meshMatches = !mesh ? !!pickedMesh : !!(pickedMesh && (pickedMesh === mesh || _IsDescendantOf(pickedMesh, mesh)));
+        if (meshMatches && pickedMesh) {
+            this.pointerId.setValue((pickedInfo.event as IPointerEvent).pointerId, context);
+            this.pickOrigin.setValue(pickedInfo.pickInfo!.ray?.origin!, context);
+            this.pickedPoint.setValue(pickedInfo.pickInfo!.pickedPoint!, context);
+            this.pickedMesh.setValue(pickedMesh, context);
+            this._execute(context);
+            // stop the propagation if the configuration says so
+            return !this.config?.stopPropagation;
+        } else {
+            // reset the outputs
+            this.pointerId.resetToDefaultValue(context);
+            this.pickOrigin.resetToDefaultValue(context);
+            this.pickedPoint.resetToDefaultValue(context);
+            this.pickedMesh.resetToDefaultValue(context);
+        }
+        return true;
+    }
+
+    /**
+     * @internal
+     */
+    public override _preparePendingTasks(_context: FlowGraphContext): void {
+        // no-op
+    }
+
+    /**
+     * @internal
+     */
+    public override _cancelPendingTasks(_context: FlowGraphContext): void {
+        // no-op
+    }
+
+    /**
+     * @returns class name of the block.
+     */
+    public override getClassName(): string {
+        return FlowGraphBlockNames.MeshPickEvent;
+    }
+}
+
+let _Registered = false;
+/**
+ * Register side effects for flowGraphMeshPickEventBlock.
+ * Safe to call multiple times; only the first call has an effect.
+ */
+export function RegisterFlowGraphMeshPickEventBlock(): void {
+    if (_Registered) {
+        return;
+    }
+    _Registered = true;
+
+    RegisterClass(FlowGraphBlockNames.MeshPickEvent, FlowGraphMeshPickEventBlock);
+}

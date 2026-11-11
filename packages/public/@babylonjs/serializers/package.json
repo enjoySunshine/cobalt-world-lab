@@ -1,0 +1,68 @@
+{
+  "name": "@babylonjs/serializers",
+  "version": "9.35.0",
+  "main": "index.js",
+  "module": "index.js",
+  "types": "index.d.ts",
+  "files": [
+    "**/*.js",
+    "**/*.d.ts",
+    "**/*.map",
+    "readme.md",
+    "license.md"
+  ],
+  "scripts": {
+    "build": "npm run clean && npm run compile",
+    "clean": "rimraf dist && rimraf *.tsbuildinfo -g && rimraf \"./**/*.!(md|json|build.json)\" -g",
+    "compile": "tsc -b tsconfig.build.json && build-tools -c tp --outDir . --buildType es6 --basePackage @babylonjs/serializers --appendJS",
+    "postcompile": "build-tools -c add-js-to-es6"
+  },
+  "devDependencies": {
+    "@babylonjs/core": "9.35.0",
+    "@dev/build-tools": "^1.0.0",
+    "@dev/serializers": "^1.0.0",
+    "babylonjs-gltf2interface": "9.35.0"
+  },
+  "peerDependencies": {
+    "@babylonjs/core": "^9.0.0",
+    "babylonjs-gltf2interface": "^9.0.0"
+  },
+  "keywords": [
+    "3D",
+    "javascript",
+    "html5",
+    "webgl",
+    "babylon.js"
+  ],
+  "license": "Apache-2.0",
+  "esnext": "index.js",
+  "type": "module",
+  "sideEffects": [
+    "**/index.js",
+    "**/*transmission.js",
+    "glTF/2.0/Extensions/*coat.js",
+    "glTF/2.0/Extensions/EXT_lights_area.js",
+    "glTF/2.0/Extensions/EXT_mesh_gpu_instancing.js",
+    "glTF/2.0/Extensions/EXT_texture_avif.js",
+    "glTF/2.0/Extensions/EXT_texture_webp.js",
+    "glTF/2.0/Extensions/KHR_draco_mesh_compression.js",
+    "glTF/2.0/Extensions/KHR_interactivity.js",
+    "glTF/2.0/Extensions/KHR_lights_punctual.js",
+    "glTF/2.0/Extensions/KHR_materials_anisotropy.js",
+    "glTF/2.0/Extensions/KHR_materials_diffuse_roughness.js",
+    "glTF/2.0/Extensions/KHR_materials_dispersion.js",
+    "glTF/2.0/Extensions/KHR_materials_emissive_strength.js",
+    "glTF/2.0/Extensions/KHR_materials_fuzz.js",
+    "glTF/2.0/Extensions/KHR_materials_ior.js",
+    "glTF/2.0/Extensions/KHR_materials_iridescence.js",
+    "glTF/2.0/Extensions/KHR_materials_openpbr.js",
+    "glTF/2.0/Extensions/KHR_materials_scatter.js",
+    "glTF/2.0/Extensions/KHR_materials_sheen.js",
+    "glTF/2.0/Extensions/KHR_materials_specular.js",
+    "glTF/2.0/Extensions/KHR_materials_unlit.js",
+    "glTF/2.0/Extensions/KHR_materials_volume.js",
+    "glTF/2.0/Extensions/KHR_texture_basisu.js",
+    "glTF/2.0/Extensions/KHR_texture_transform.js",
+    "legacy/legacy.js"
+  ]
+}
