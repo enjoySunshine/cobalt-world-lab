@@ -250,6 +250,8 @@ export function RegisterThinInstanceMesh(): void {
             this._thinInstanceDataStorage.worldMatrices[index] = matrix as Matrix;
         }
 
+        this._thinInstanceDataStorage.matrixDataVersion++;
+
         if (refresh) {
             this.thinInstanceBufferUpdated("matrix");
 
@@ -291,7 +293,11 @@ export function RegisterThinInstanceMesh(): void {
             const numMaxInstances = matrixData ? matrixData.length / 16 : 0;
 
             if (value <= numMaxInstances) {
-                this._thinInstanceDataStorage.instancesCount = value;
+                if (this._thinInstanceDataStorage.instancesCount !== value) {
+                    this._thinInstanceDataStorage.instancesCount = value;
+                    this._thinInstanceDataStorage.matrixDataVersion++;
+                    this._thinInstanceDataStorage.pickingBVH = null;
+                }
             }
         },
         enumerable: true,
@@ -317,6 +323,8 @@ export function RegisterThinInstanceMesh(): void {
             this._thinInstanceDataStorage.matrixBufferSize = buffer ? buffer.length : 32 * stride;
             this._thinInstanceDataStorage.matrixData = buffer;
             this._thinInstanceDataStorage.worldMatrices = null;
+            this._thinInstanceDataStorage.matrixDataVersion++;
+            this._thinInstanceDataStorage.pickingBVH = null;
 
             if (buffer !== null) {
                 this._thinInstanceDataStorage.instancesCount = buffer.length / stride;
@@ -343,6 +351,8 @@ export function RegisterThinInstanceMesh(): void {
             this._thinInstanceDataStorage.matrixBuffer?.dispose();
             this._thinInstanceInitializeUserStorage();
             this._thinInstanceDataStorage.instancesCount = buffer.length / stride;
+            this._thinInstanceDataStorage.matrixDataVersion++;
+            this._thinInstanceDataStorage.pickingBVH = null;
             this._userThinInstanceBuffersStorage.data[kind] = buffer;
             this._userThinInstanceBuffersStorage.strides[kind] = stride;
             this._userThinInstanceBuffersStorage.sizes[kind] = buffer.length;
@@ -383,6 +393,9 @@ export function RegisterThinInstanceMesh(): void {
         // With no visible instance, upload the whole buffer: nothing else re-syncs it when the count goes back up
         const instancesCount = this._thinInstanceDataStorage.instancesCount || undefined;
         if (kind === "matrix") {
+            // The matrix data may have been mutated in place; invalidate the picking acceleration cache.
+            this._thinInstanceDataStorage.matrixDataVersion++;
+            this._thinInstanceDataStorage.pickingBVH = null;
             if (this.thinInstanceAllowAutomaticStaticBufferRecreation && this._thinInstanceDataStorage.matrixBuffer && !this._thinInstanceDataStorage.matrixBuffer.isUpdatable()) {
                 this._thinInstanceRecreateBuffer(kind);
             }
@@ -415,6 +428,8 @@ export function RegisterThinInstanceMesh(): void {
 
     Mesh.prototype.thinInstancePartialBufferUpdate = function (kind: string, dataOrLength: Float32Array | number, offset: number): void {
         if (kind === "matrix") {
+            this._thinInstanceDataStorage.matrixDataVersion++;
+            this._thinInstanceDataStorage.pickingBVH = null;
             if (this._thinInstanceDataStorage.matrixBuffer) {
                 if (typeof dataOrLength === "number") {
                     this._thinInstanceDataStorage.matrixBuffer.updateDirectly(
@@ -593,6 +608,8 @@ export function RegisterThinInstanceMesh(): void {
                 this._thinInstanceDataStorage.matrixBuffer = this._thinInstanceCreateMatrixBuffer("world", data, false);
                 this._thinInstanceDataStorage.matrixData = data;
                 this._thinInstanceDataStorage.matrixBufferSize = newSize;
+                this._thinInstanceDataStorage.matrixDataVersion++;
+                this._thinInstanceDataStorage.pickingBVH = null;
                 if (this._scene.needsPreviousWorldMatrices && !this._thinInstanceDataStorage.previousMatrixData) {
                     this._thinInstanceDataStorage.previousMatrixBuffer?.dispose();
                     this._thinInstanceDataStorage.previousMatrixBuffer = this._thinInstanceCreateMatrixBuffer("previousWorld", data, false);

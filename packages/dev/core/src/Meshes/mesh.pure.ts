@@ -21,6 +21,7 @@ import { Geometry } from "./geometry";
 import { type IMeshDataOptions, AbstractMesh } from "./abstractMesh.pure";
 import { SubMesh } from "./subMesh.pure";
 import { type BoundingSphere } from "../Culling/boundingSphere";
+import type { ThinInstancePickingBVH } from "../Culling/thinInstancePickingBvh";
 import { type Effect } from "../Materials/effect.pure";
 import { Material } from "../Materials/material.pure";
 import { MaterialHelperGeometryRendering } from "../Materials/materialHelper.geometryrendering";
@@ -183,6 +184,17 @@ class _ThinInstanceDataStorage {
     public worldMatrices: Nullable<Matrix[]> = null;
     /** @internal */
     public masterMeshPreviousWorldMatrix: Nullable<Matrix>;
+    /**
+     * Bumped every time the instance matrices or instance count change through a public API.
+     * Used to invalidate the lazy thin-instance picking acceleration structure.
+     * @internal
+     */
+    public matrixDataVersion: number = 0;
+    /**
+     * Lazily-built BVH accelerating ray picks against the thin instances (mesh-local space).
+     * @internal
+     */
+    public pickingBVH: Nullable<ThinInstancePickingBVH> = null;
 }
 
 /**
@@ -5913,7 +5925,7 @@ export class Mesh extends AbstractMesh implements IGetSetVerticesData {
      * * The parameter `size` (positive float, default 1) sets the polygon size
      * * You can overwrite the `size` on each dimension bu using the parameters `sizeX`, `sizeY` or `sizeZ` (positive floats, default to `size` value)
      * * You can build other polyhedron types than the 15 embbeded ones by setting the parameter `custom` (`polyhedronObject`, default null). If you set the parameter `custom`, this overwrittes the parameter `type`
-     * * A `polyhedronObject` is a formatted javascript object. You'll find a full file with pre-set polyhedra here : 
+     * * A `polyhedronObject` is a formatted javascript object. You'll find a full file with pre-set polyhedra here :
      * * You can set the color and the UV of each side of the polyhedron with the parameters `faceColors` (Color4, default `(1, 1, 1, 1)`) and faceUV (Vector4, default `(0, 0, 1, 1)`)
      * * To understand how to set `faceUV` or `faceColors`, please read this by considering the right number of faces of your polyhedron, instead of only 6 for the box : https://doc.babylonjs.com/features/featuresDeepDive/materials/using/texturePerBoxFace
      * * The parameter `flat` (boolean, default true). If set to false, it gives the polyhedron a single global face, so less vertices and shared normals. In this case, `faceColors` and `faceUV` are ignored
